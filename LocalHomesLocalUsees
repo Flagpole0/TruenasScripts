@@ -3,6 +3,10 @@
 provision_local_homes.py  —  private per-user folders under ONE dataset,
 driven by a CSV of LOCAL TrueNAS SCALE users and groups.
 
+Runs from ANY machine (Linux, macOS, Windows) and talks to TrueNAS over its
+websocket API using an API key. Nothing is installed on the NAS, and the
+credential-card PDF is written on the machine you run it from.
+
 What it converges to, for every row in the CSV:
   - every group named in the CSV exists (local group, SMB-enabled)
   - the user exists (only with --create-users) and is a member of its CSV
@@ -29,12 +33,29 @@ With --manage-parent, the parent dataset root gets:
         --admin-group   FULL_CONTROL
 
 Behaviour:
-  - Dry-run unless --apply. Read-only queries still run so the plan is real.
+  - Dry-run unless --apply. Read-only API queries still run so the plan is real.
   - Additive only: never deletes users, groups, folders, memberships or quotas.
     Folders with no matching CSV row are REPORTED as orphans, not touched.
-  - ACLs/users/quotas go through midclt, so the GUI sees first-class objects.
+  - Everything goes through the middleware API, so the GUI sees first-class
+    objects (no shell access to the NAS is needed or used).
   - ACL changes apply to the folder itself only (non-recursive); existing
     contents are not rewritten.
+
+Connecting:
+  - TLS only (wss://). TrueNAS 25.04+ revokes an API key that is ever sent
+    over plain HTTP, so this script has no non-TLS mode.
+  - Uses the JSON-RPC 2.0 endpoint (/api/current, TrueNAS 25.04+) and falls
+    back to the legacy endpoint (/websocket) on older releases.
+  - TrueNAS ships a self-signed certificate. Either pin it:
+        ./provision_local_homes.py --host nas.lan --show-fingerprint
+        ... --fingerprint AB:CD:...   (compare with the NAS first, see README)
+    or give the CA that signed it with --ca-cert, or install a cert your
+    system already trusts.
+  - The API key is read from $TRUENAS_API_KEY, from --api-key-file, or is
+    prompted for. It is never accepted as a command-line argument.
+  - Create the key under the user icon > API Keys. It acts as the user it
+    belongs to, which needs rights to manage accounts, datasets and ACLs
+    (a full admin is simplest).
 
 CSV (header row required; '#' at start of username = comment):
     username,full_name,groups,quota
@@ -43,102 +64,332 @@ CSV (header row required; '#' at start of username = comment):
     carol,,,1T
 
 Usage:
-    ./provision_local_homes.py users.csv --parent /mnt/tank/homes
-    ./provision_local_homes.py users.csv --parent /mnt/tank/homes \
-        --homes-group nas-homes --admin-group nas-admins --manage-parent
-    ./provision_local_homes.py users.csv --parent /mnt/tank/homes \
-        --create-users --apply
-    ./provision_local_homes.py users.csv --parent /mnt/tank/homes --only alice --apply
-    ./provision_local_homes.py users.csv --parent /mnt/tank/homes \
-        --reset-passwords --only bob --share-path '\\\\nas\\homes\\{user}' --apply
+    export TRUENAS_API_KEY=...            # or --api-key-file ~/.truenas-key
+    ./provision_local_homes.py users.csv --host nas.lan --fingerprint AB:CD:... \
+        --parent /mnt/tank/homes
+    ./provision_local_homes.py users.csv --host nas.lan --fingerprint AB:CD:... \
+        --parent /mnt/tank/homes --admin-group nas-admins --manage-parent
+    ./provision_local_homes.py users.csv --host nas.lan --fingerprint AB:CD:... \
+        --parent /mnt/tank/homes --create-users --apply
+    ./provision_local_homes.py users.csv --host nas.lan --fingerprint AB:CD:... \
+        --parent /mnt/tank/homes --reset-passwords --only bob \
+        --share-path '\\\\nas\\homes\\{user}' --apply
 
-Requires: python3 and `midclt` on PATH (run ON the TrueNAS host, as root),
-and eff_large_wordlist.txt next to this script (or --wordlist PATH):
+Requires: Python 3.8+ (standard library only) and eff_large_wordlist.txt next
+to this script (or --wordlist PATH):
     https://www.eff.org/files/2016/07/18/eff_large_wordlist.txt
 The file can be used as downloaded (the dice-number column is ignored).
-No third-party Python packages are needed.
 """
 
 import argparse
+import base64
 import csv
 import datetime
+import getpass
+import hashlib
+import itertools
 import json
 import os
 import re
 import secrets
-import subprocess
+import socket
+import ssl
+import struct
 import sys
+import time
 
 SPECIAL_TAGS = ("owner@", "group@", "everyone@")
 USERNAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_.-]{0,31}")
 GROUPNAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_.-]{0,31}")
 SIZE_RE = re.compile(r"(\d+(?:\.\d+)?)\s*([KMGTP]?)(?:i?B)?", re.I)
 UNITS = {"": 1, "K": 1024, "M": 1024**2, "G": 1024**3, "T": 1024**4, "P": 1024**5}
+ENOENT = 2
 
 
 # --------------------------------------------------------------------------- #
-# midclt wrapper
+# Minimal WebSocket client (RFC 6455) over TLS — standard library only
 # --------------------------------------------------------------------------- #
-def midclt(method, *params, job=False, dry=False, mutate=False, label=""):
-    """Run `midclt call [-job] <method> <json>...`. Mutating calls are printed,
-    not executed, in dry-run. Read-only calls always execute."""
-    cmd = ["midclt", "call"]
-    if job:
-        cmd.append("-job")
-    cmd.append(method)
-    cmd += [json.dumps(p) for p in params]
+class HandshakeError(Exception):
+    def __init__(self, status, msg):
+        super().__init__(msg)
+        self.status = status
 
+
+class WebSocket:
+    GUID = b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
+
+    def __init__(self, host, port, path, ctx, timeout):
+        raw = socket.create_connection((host, port), timeout=timeout)
+        try:
+            self.sock = ctx.wrap_socket(raw, server_hostname=host)
+        except Exception:
+            raw.close()
+            raise
+        self.buf = b""
+        key = base64.b64encode(os.urandom(16))
+        host_hdr = host if port == 443 else f"{host}:{port}"
+        self.sock.sendall(
+            f"GET {path} HTTP/1.1\r\nHost: {host_hdr}\r\nUpgrade: websocket\r\n"
+            f"Connection: Upgrade\r\nSec-WebSocket-Key: {key.decode()}\r\n"
+            f"Sec-WebSocket-Version: 13\r\n\r\n".encode())
+        while b"\r\n\r\n" not in self.buf:
+            chunk = self.sock.recv(4096)
+            if not chunk:
+                raise HandshakeError(0, "connection closed during handshake")
+            self.buf += chunk
+            if len(self.buf) > 65536:
+                raise HandshakeError(0, "oversized handshake response")
+        head, self.buf = self.buf.split(b"\r\n\r\n", 1)
+        lines = head.decode("latin-1").split("\r\n")
+        parts = lines[0].split(" ", 2)
+        status = int(parts[1]) if len(parts) > 1 and parts[1].isdigit() else 0
+        if status != 101:
+            self.sock.close()
+            raise HandshakeError(status, f"HTTP {status} from {path}")
+        hdrs = {k.strip().lower(): v.strip()
+                for k, v in (l.split(":", 1) for l in lines[1:] if ":" in l)}
+        want = base64.b64encode(hashlib.sha1(key + self.GUID).digest()).decode()
+        if hdrs.get("sec-websocket-accept") != want:
+            self.sock.close()
+            raise HandshakeError(status, "bad Sec-WebSocket-Accept")
+
+    def peer_fingerprint(self):
+        der = self.sock.getpeercert(binary_form=True)
+        return hashlib.sha256(der).hexdigest().upper()
+
+    def _read(self, n):
+        while len(self.buf) < n:
+            chunk = self.sock.recv(max(65536, n - len(self.buf)))
+            if not chunk:
+                raise ConnectionError("websocket closed by server")
+            self.buf += chunk
+        out, self.buf = self.buf[:n], self.buf[n:]
+        return out
+
+    def _send_frame(self, opcode, payload):
+        n = len(payload)
+        head = bytes([0x80 | opcode])
+        if n < 126:
+            head += bytes([0x80 | n])
+        elif n < 65536:
+            head += bytes([0x80 | 126]) + struct.pack(">H", n)
+        else:
+            head += bytes([0x80 | 127]) + struct.pack(">Q", n)
+        mask = os.urandom(4)
+        masked = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+        self.sock.sendall(head + mask + masked)
+
+    def send_text(self, text):
+        self._send_frame(0x1, text.encode())
+
+    def recv_text(self):
+        parts = []
+        while True:
+            b1, b2 = self._read(2)
+            fin, opcode = b1 & 0x80, b1 & 0x0F
+            n = b2 & 0x7F
+            if n == 126:
+                n = struct.unpack(">H", self._read(2))[0]
+            elif n == 127:
+                n = struct.unpack(">Q", self._read(8))[0]
+            mask = self._read(4) if b2 & 0x80 else None
+            data = self._read(n)
+            if mask:
+                data = bytes(b ^ mask[i % 4] for i, b in enumerate(data))
+            if opcode == 0x8:
+                raise ConnectionError("websocket closed by server")
+            if opcode == 0x9:
+                self._send_frame(0xA, data)
+                continue
+            if opcode == 0xA:
+                continue
+            parts.append(data)
+            if fin:
+                return b"".join(parts).decode()
+
+    def close(self):
+        try:
+            self._send_frame(0x8, struct.pack(">H", 1000))
+        except OSError:
+            pass
+        try:
+            self.sock.close()
+        except OSError:
+            pass
+
+
+# --------------------------------------------------------------------------- #
+# TrueNAS middleware client
+# --------------------------------------------------------------------------- #
+class ApiError(Exception):
+    def __init__(self, msg, errno=None):
+        super().__init__(msg)
+        self.errno = errno
+
+
+def _norm_fp(fp):
+    return re.sub(r"[^0-9A-Fa-f]", "", fp or "").upper()
+
+
+def _fmt_fp(hexfp):
+    return ":".join(hexfp[i:i + 2] for i in range(0, len(hexfp), 2))
+
+
+def tls_context(ca_cert, pinned):
+    if pinned:
+        # Chain/hostname checks are replaced by an exact certificate pin,
+        # verified before anything (including the API key) is sent.
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+    else:
+        ctx = ssl.create_default_context(cafile=ca_cert)
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    return ctx
+
+
+class TrueNAS:
+    ENDPOINTS = {"jsonrpc": "/api/current", "legacy": "/websocket"}
+
+    def __init__(self, host, port, ctx, fingerprint=None, protocol="auto", timeout=30):
+        self.host, self.port, self.ctx = host, port, ctx
+        self.fingerprint = _norm_fp(fingerprint) if fingerprint else None
+        self.timeout = timeout
+        self.ids = itertools.count(1)
+        order = ["jsonrpc", "legacy"] if protocol == "auto" else [protocol]
+        last = None
+        for proto in order:
+            try:
+                self.ws = WebSocket(host, port, self.ENDPOINTS[proto], ctx, timeout)
+            except HandshakeError as e:
+                last = e
+                if protocol == "auto" and e.status in (400, 403, 404, 405):
+                    continue
+                raise ApiError(f"websocket handshake failed: {e}")
+            self.protocol = proto
+            break
+        else:
+            raise ApiError(f"no usable API endpoint on {host}:{port} ({last})")
+
+        if self.fingerprint is not None:
+            got = self.ws.peer_fingerprint()
+            if got != self.fingerprint:
+                self.ws.close()
+                raise ApiError("TLS certificate fingerprint MISMATCH — refusing to send "
+                               f"credentials.\n  expected {_fmt_fp(self.fingerprint)}\n"
+                               f"  got      {_fmt_fp(got)}")
+
+        if self.protocol == "legacy":
+            self.ws.send_text(json.dumps({"msg": "connect", "version": "1", "support": ["1"]}))
+            while True:
+                msg = json.loads(self.ws.recv_text())
+                if msg.get("msg") == "connected":
+                    break
+                if msg.get("msg") == "failed":
+                    raise ApiError("legacy API refused the connection")
+
+    def close(self):
+        self.ws.close()
+
+    def _rpc(self, method, params):
+        n = next(self.ids)
+        if self.protocol == "jsonrpc":
+            self.ws.send_text(json.dumps({"jsonrpc": "2.0", "id": n,
+                                          "method": method, "params": params}))
+        else:
+            n = str(n)
+            self.ws.send_text(json.dumps({"id": n, "msg": "method",
+                                          "method": method, "params": params}))
+        while True:
+            msg = json.loads(self.ws.recv_text())
+            if msg.get("id") != n:
+                continue  # event/notification or unrelated message
+            err = msg.get("error")
+            if err:
+                if self.protocol == "jsonrpc":
+                    data = err.get("data") or {}
+                    reason = data.get("reason") or err.get("message")
+                    errno = data.get("error")
+                else:
+                    reason, errno = err.get("reason") or err.get("error"), err.get("error")
+                raise ApiError(f"{method}: {reason}", errno if isinstance(errno, int) else None)
+            return msg.get("result")
+
+    def call(self, method, *params, job=False):
+        result = self._rpc(method, list(params))
+        return self._wait_job(result, method) if job else result
+
+    def _wait_job(self, job_id, method, limit=900):
+        deadline = time.monotonic() + limit
+        while time.monotonic() < deadline:
+            jobs = self._rpc("core.get_jobs", [[["id", "=", job_id]]])
+            if not jobs:
+                raise ApiError(f"{method}: job {job_id} disappeared")
+            job = jobs[0]
+            state = job.get("state")
+            if state == "SUCCESS":
+                return job.get("result")
+            if state in ("FAILED", "ABORTED"):
+                raise ApiError(f"{method}: job {state.lower()}: {job.get('error')}")
+            time.sleep(0.5)
+        raise ApiError(f"{method}: job {job_id} timed out")
+
+    def login(self, api_key, api_user=None):
+        try:
+            ok = self._rpc("auth.login_with_api_key", [api_key])
+        except ApiError:
+            ok = False
+        if not ok and api_user:
+            res = self._rpc("auth.login_ex", [{"mechanism": "API_KEY_PLAIN",
+                                               "username": api_user, "api_key": api_key}])
+            ok = isinstance(res, dict) and res.get("response_type") == "SUCCESS"
+        if not ok:
+            raise ApiError("API key login failed (wrong key, revoked key, or user lacks access)")
+
+
+_API = None
+
+
+def call(method, *params, job=False, dry=False, mutate=False, label=""):
+    """Call the middleware. Mutating calls are printed, not executed, in
+    dry-run. Read-only calls always execute."""
     if dry and mutate:
         shown = " ".join(json.dumps(p) for p in params)
-        print(f"      [DRY-RUN] midclt call {'-job ' if job else ''}{method} {shown}")
-        return None
-
-    try:
-        out = subprocess.run(cmd, capture_output=True, text=True, check=True)
-    except FileNotFoundError:
-        sys.exit("ERROR: midclt not found — run this ON the TrueNAS SCALE host.")
-    except subprocess.CalledProcessError as e:
-        sys.exit(f"ERROR: midclt {method} failed ({label}):\n{e.stderr.strip()}")
-
-    text = out.stdout.strip()
-    if not text:
+        print(f"      [DRY-RUN] {method} {shown}")
         return None
     try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        # -job prints progress lines before the final JSON result
+        return _API.call(method, *params, job=job)
+    except ApiError as e:
+        if label:
+            raise ApiError(f"{e} ({label})", e.errno) from None
+        raise
+
+
+def read_api_key(args):
+    if args.api_key_file:
         try:
-            return json.loads(text.splitlines()[-1])
-        except json.JSONDecodeError:
-            return None
+            with open(os.path.expanduser(args.api_key_file)) as f:
+                key = f.read().strip()
+        except OSError as e:
+            sys.exit(f"ERROR: cannot read --api-key-file: {e}")
+    else:
+        key = os.environ.get("TRUENAS_API_KEY", "").strip()
+        if not key and sys.stdin.isatty():
+            key = getpass.getpass("TrueNAS API key: ").strip()
+    if not key:
+        sys.exit("ERROR: no API key (set TRUENAS_API_KEY or use --api-key-file).")
+    return key
 
 
-_WARNED_ARGV = False
-
-
-def midclt_secret(method, *params, label=""):
-    """Call the middleware without putting secrets on a command line (visible
-    in `ps`). Uses the in-process API client; falls back to midclt with a warning."""
-    global _WARNED_ARGV
-    Client = None
-    try:
-        from truenas_api_client import Client          # SCALE 25.04+
-    except ImportError:
-        try:
-            from middlewared.client import Client      # older SCALE
-        except ImportError:
-            pass
-    if Client is not None:
-        try:
-            with Client() as c:
-                return c.call(method, *params)
-        except Exception as e:
-            sys.exit(f"ERROR: {method} failed ({label}): {e}")
-    if not _WARNED_ARGV:
-        print("    !! API client module not found; falling back to midclt "
-              "(passphrase briefly visible in the process list)")
-        _WARNED_ARGV = True
-    return midclt(method, *params, mutate=True, label=label)
+def split_host(raw):
+    raw = (raw or "").strip()
+    if raw.startswith("["):                       # [ipv6]:port
+        host, _, rest = raw[1:].partition("]")
+        return host, int(rest[1:]) if rest.startswith(":") else 443
+    if raw.count(":") == 1:
+        host, port = raw.split(":")
+        return host, int(port)
+    return raw, 443
 
 
 # --------------------------------------------------------------------------- #
@@ -334,7 +585,7 @@ def load_csv(path):
 def ensure_group(name, dry, cache, stats):
     if name in cache:
         return cache[name]
-    res = midclt("group.query", [["group", "=", name]], label=f"query group {name}")
+    res = call("group.query", [["group", "=", name]], label=f"query group {name}")
     if res:
         grp = res[0]
         if grp.get("local") is False:
@@ -342,14 +593,14 @@ def ensure_group(name, dry, cache, stats):
         print(f"  [group {name}] OK (gid {grp.get('gid')})")
     else:
         print(f"  [group {name}] CREATE")
-        created = midclt("group.create", {"name": name, "smb": True},
-                         dry=dry, mutate=True, label=f"create group {name}")
+        created = call("group.create", {"name": name, "smb": True},
+                       dry=dry, mutate=True, label=f"create group {name}")
         stats["groups_created"] += 1
         if dry:
             grp = {"id": None, "gid": None, "group": name, "_planned": True}
         else:
             gid_lookup = created if isinstance(created, int) else (created or {}).get("id")
-            grp = midclt("group.query", [["id", "=", gid_lookup]])[0]
+            grp = call("group.query", [["id", "=", gid_lookup]])[0]
     cache[name] = grp
     return grp
 
@@ -363,7 +614,7 @@ def _card(row, passphrase, args):
 def ensure_user(row, group_objs, args, dry, cards, gen, stats):
     """Return (uid, gid) for the folder owner, or (None, None) if unavailable."""
     name = row["username"]
-    res = midclt("user.query", [["username", "=", name]], label=f"query user {name}")
+    res = call("user.query", [["username", "=", name]], label=f"query user {name}")
     user = res[0] if res else None
 
     if user is None:
@@ -384,17 +635,17 @@ def ensure_user(row, group_objs, args, dry, cards, gen, stats):
             "password": passphrase,
         }
         if dry:
-            print(f"      [DRY-RUN] midclt call user.create "
+            print(f"      [DRY-RUN] user.create "
                   f"{json.dumps({**payload, 'password': '<redacted>'})}")
             created = None
         else:
-            created = midclt_secret("user.create", payload, label=f"create user {name}")
+            created = call("user.create", payload, label=f"create user {name}")
         stats["users_created"] += 1
         cards.append(_card(row, passphrase, args))
         if dry:
             return "<new>", "<new>"
         user_id = created if isinstance(created, int) else created.get("id")
-        user = midclt("user.query", [["id", "=", user_id]])[0]
+        user = call("user.query", [["id", "=", user_id]])[0]
         return user["uid"], user["group"]["bsdgrp_gid"]
 
     if user.get("builtin"):
@@ -412,8 +663,8 @@ def ensure_user(row, group_objs, args, dry, cards, gen, stats):
         names = ", ".join(g["group"] for g in missing)
         print(f"    -> ADD to groups: {names}")
         new_ids = have + [g["id"] for g in missing if g.get("id") is not None]
-        midclt("user.update", user["id"], {"groups": new_ids},
-               dry=dry, mutate=True, label=f"update groups {name}")
+        call("user.update", user["id"], {"groups": new_ids},
+             dry=dry, mutate=True, label=f"update groups {name}")
         stats["memberships_added"] += len(missing)
     else:
         print(f"    -> user OK (uid {user['uid']})")
@@ -422,14 +673,35 @@ def ensure_user(row, group_objs, args, dry, cards, gen, stats):
         print(f"    -> RESET password to new passphrase")
         passphrase = gen.new()
         if dry:
-            print(f"      [DRY-RUN] midclt call user.update {user['id']} "
+            print(f"      [DRY-RUN] user.update {user['id']} "
                   f'{{"password": "<redacted>"}}')
         else:
-            midclt_secret("user.update", user["id"], {"password": passphrase},
-                          label=f"reset password {name}")
+            call("user.update", user["id"], {"password": passphrase},
+                 label=f"reset password {name}")
         stats["passwords_reset"] += 1
         cards.append(_card(row, passphrase, args))
     return user["uid"], user["group"]["bsdgrp_gid"]
+
+
+# --------------------------------------------------------------------------- #
+# Filesystem (via API)
+# --------------------------------------------------------------------------- #
+def list_entries(path):
+    """name -> type ('DIRECTORY', 'FILE', 'SYMLINK', 'OTHER') for one directory."""
+    return {e["name"]: e.get("type") for e in call("filesystem.listdir", path, [],
+                                                   label=f"list {path}") or []}
+
+
+def make_dir(path):
+    """filesystem.mkdir takes a dict on newer releases and a bare path on older."""
+    try:
+        call("filesystem.mkdir", {"path": path, "options": {"mode": "700"}},
+             label=f"mkdir {path}")
+    except ApiError as first:
+        try:
+            call("filesystem.mkdir", path, label=f"mkdir {path}")
+        except ApiError:
+            raise first from None
 
 
 # --------------------------------------------------------------------------- #
@@ -485,17 +757,38 @@ def apply_acl(path, uid, gid, dacl, dry, label):
         "options": {"stripacl": False, "recursive": False,
                     "traverse": False, "canonicalize": True},
     }
-    midclt("filesystem.setacl", payload, job=True, dry=dry, mutate=True, label=label)
+    call("filesystem.setacl", payload, job=True, dry=dry, mutate=True, label=label)
 
 
 # --------------------------------------------------------------------------- #
 # Main
 # --------------------------------------------------------------------------- #
-def main():
-    ap = argparse.ArgumentParser(description="Provision private per-user folders from a CSV.")
-    ap.add_argument("csv", help="CSV of users (username,full_name,groups,quota)")
-    ap.add_argument("--parent", required=True,
-                    help="Mountpoint of the parent dataset, e.g. /mnt/tank/homes")
+def build_parser():
+    # allow_abbrev=False: otherwise "--api-key SECRET" would silently expand to
+    # --api-key-file and echo the secret back in the "cannot read" error.
+    ap = argparse.ArgumentParser(
+        allow_abbrev=False,
+        description="Provision private per-user folders on TrueNAS SCALE from a CSV, over the API.")
+    ap.add_argument("csv", nargs="?", help="CSV of users (username,full_name,groups,quota)")
+    ap.add_argument("--parent", help="Mountpoint of the parent dataset, e.g. /mnt/tank/homes")
+
+    con = ap.add_argument_group("connection")
+    con.add_argument("--host", default=os.environ.get("TRUENAS_HOST"),
+                     help="TrueNAS host or host:port (default: $TRUENAS_HOST)")
+    con.add_argument("--fingerprint", default=os.environ.get("TRUENAS_FINGERPRINT"),
+                     help="Pin the NAS TLS certificate by SHA-256 fingerprint "
+                          "(default: $TRUENAS_FINGERPRINT)")
+    con.add_argument("--ca-cert", help="CA bundle to verify the NAS certificate against "
+                                       "(instead of the system trust store)")
+    con.add_argument("--show-fingerprint", action="store_true",
+                     help="Print the NAS certificate fingerprint and exit (no login)")
+    con.add_argument("--api-key-file", help="File holding the API key (else $TRUENAS_API_KEY, else prompt)")
+    con.add_argument("--api-user", help="Username the key belongs to; only needed if the "
+                                        "server rejects the older key-login call")
+    con.add_argument("--protocol", choices=("auto", "jsonrpc", "legacy"), default="auto",
+                     help="API endpoint: /api/current (jsonrpc), /websocket (legacy), or auto")
+    con.add_argument("--timeout", type=float, default=30, help="Socket timeout in seconds")
+
     ap.add_argument("--homes-group", default="nas-homes",
                     help="Group every CSV user joins; gets TRAVERSE on the parent (default: nas-homes)")
     ap.add_argument("--admin-group", help="Optional break-glass group with FULL_CONTROL on every folder")
@@ -505,8 +798,7 @@ def main():
                     help="Create missing local users with a random passphrase")
     ap.add_argument("--reset-passwords", action="store_true",
                     help="Also give EXISTING users (in scope) a new passphrase. Combine with --only.")
-    ap.add_argument("--words", type=int, default=3,
-                    help="Words per passphrase (default 3)")
+    ap.add_argument("--words", type=int, default=3, help="Words per passphrase (default 3)")
     ap.add_argument("--sep", default="-", help="Word separator (default '-')")
     ap.add_argument("--wordlist",
                     default=os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -521,13 +813,48 @@ def main():
                     help=r"Optional connect-to line; {user} is replaced, e.g. '\\nas\homes\{user}'")
     ap.add_argument("--only", metavar="USER", help="Process only this username")
     ap.add_argument("--apply", action="store_true", help="Execute changes (default is dry-run)")
-    args = ap.parse_args()
+    return ap
 
+
+def connect(args):
+    host, port = split_host(args.host)
+    if not host:
+        sys.exit("ERROR: --host is required (or set TRUENAS_HOST).")
+    pinned = bool(args.fingerprint) or args.show_fingerprint
+    if args.fingerprint and len(_norm_fp(args.fingerprint)) != 64:
+        sys.exit("ERROR: --fingerprint must be a SHA-256 fingerprint (64 hex digits).")
+    ctx = tls_context(args.ca_cert, pinned)
+    try:
+        api = TrueNAS(host, port, ctx, None if args.show_fingerprint else args.fingerprint,
+                      args.protocol, args.timeout)
+    except ssl.SSLCertVerificationError as e:
+        sys.exit(f"ERROR: TLS verification failed for {host}: {e.verify_message}.\n"
+                 "  TrueNAS uses a self-signed certificate by default. Run with "
+                 "--show-fingerprint, check it against the NAS, then pass --fingerprint.")
+    except (OSError, ApiError) as e:
+        sys.exit(f"ERROR: cannot connect to {host}:{port}: {e}")
+    return api, host, port
+
+
+def main(argv=None):
+    global _API
+    args = build_parser().parse_args(argv)
+
+    if args.show_fingerprint:
+        api, host, port = connect(args)
+        fp = api.ws.peer_fingerprint()
+        api.close()
+        print(f"{host}:{port}  ({api.protocol} API)\nSHA-256 fingerprint: {_fmt_fp(fp)}")
+        print("Check it against the NAS before trusting it (see README), then pass "
+              "--fingerprint or set TRUENAS_FINGERPRINT.")
+        return
+
+    if not args.csv or not args.parent:
+        sys.exit("ERROR: the CSV argument and --parent are required.")
     dry = not args.apply
-    parent = os.path.normpath(args.parent)
-
-    if not dry and os.geteuid() != 0:
-        sys.exit("ERROR: --apply must run as root (folder creation needs it).")
+    parent = os.path.normpath(args.parent).replace("\\", "/")
+    if not parent.startswith("/mnt/"):
+        sys.exit(f"ERROR: --parent must be a path on the NAS under /mnt/, got {parent}")
     if args.words < 2:
         sys.exit("ERROR: --words must be at least 2.")
     gen = PassphraseGen(args.wordlist, args.words, args.sep)
@@ -541,29 +868,37 @@ def main():
         if not rows:
             sys.exit(f"ERROR: --only '{args.only}' matched no CSV row.")
 
-    print(f"=== local homes provisioner [{'DRY-RUN' if dry else 'APPLY'}] parent={parent} ===\n")
+    api_key = read_api_key(args)
+    _API, host, port = connect(args)
+    try:
+        _API.login(api_key, args.api_user)
+    except ApiError as e:
+        _API.close()
+        sys.exit(f"ERROR: {e}")
+    del api_key
+    try:
+        version = _API.call("system.version")
+    except ApiError:
+        version = "unknown version"
 
-    # --- pre-flight: parent must be an NFSv4 dataset mountpoint -------------
-    ds = midclt("pool.dataset.query", [["mountpoint", "=", parent]], label="query parent")
-    if not ds:
-        sys.exit(f"ERROR: {parent} is not the mountpoint of a dataset.")
-    ds = ds[0]
-    acltype = str((ds.get("acltype") or {}).get("value", ds.get("acltype"))).upper()
-    if "NFS" not in acltype:
-        sys.exit(f"ERROR: dataset {ds['id']} acltype is {acltype}; set it to NFSv4 first.")
-    if not os.path.isdir(parent):
-        sys.exit(f"ERROR: {parent} is not a directory on this host.")
+    print(f"=== local homes provisioner [{'DRY-RUN' if dry else 'APPLY'}] "
+          f"{host} ({version}, {_API.protocol} API) parent={parent} ===\n")
 
     stats = {k: 0 for k in ("groups_created", "users_created", "users_missing",
                             "memberships_added", "passwords_reset", "skipped",
                             "folders_created", "acls_set", "quotas_set", "ok")}
     cards = []
     gcache = {}
+    orphans = []
+    failed = None
     print(f"passphrases: {args.words} words from {len(gen.pool)} "
           f"(~{gen.bits():.0f} bits each), separator '{args.sep}'\n")
     try:
-        orphans = run(args, dry, parent, ds, rows, csv_names, gen, cards, gcache, stats)
+        orphans = run(args, dry, parent, rows, csv_names, gen, cards, gcache, stats)
+    except ApiError as e:
+        failed = e
     finally:
+        _API.close()
         # Always emit cards for passphrases already set, even if a later step failed.
         if cards:
             write_cards_pdf(cards_out, cards, args.card_title, sample=dry)
@@ -575,6 +910,9 @@ def main():
             else:
                 print()
 
+    if failed:
+        sys.exit(f"ERROR: {failed}\n(stopped; changes made before this point were kept)")
+
     print("=== summary ===")
     for k, v in stats.items():
         print(f"  {k.replace('_', ' '):<18} {v}")
@@ -583,7 +921,20 @@ def main():
         print("\n(DRY-RUN — nothing was changed. Re-run with --apply to execute.)")
 
 
-def run(args, dry, parent, ds, rows, csv_names, gen, cards, gcache, stats):
+def run(args, dry, parent, rows, csv_names, gen, cards, gcache, stats):
+
+    # --- pre-flight: parent must be an NFSv4 dataset mountpoint -------------
+    ds = call("pool.dataset.query", [["mountpoint", "=", parent]], label="query parent")
+    if not ds:
+        raise ApiError(f"{parent} is not the mountpoint of a dataset on this NAS")
+    ds = ds[0]
+    raw_acltype = ds.get("acltype")
+    if isinstance(raw_acltype, dict):          # {"value": "NFSV4", ...} on most releases
+        raw_acltype = raw_acltype.get("value")
+    acltype = str(raw_acltype).upper()
+    if "NFS" not in acltype:
+        raise ApiError(f"dataset {ds['id']} acltype is {acltype}; set it to NFSv4 first")
+    entries = list_entries(parent)
 
     # --- groups --------------------------------------------------------------
     print("[groups]")
@@ -604,7 +955,7 @@ def run(args, dry, parent, ds, rows, csv_names, gen, cards, gcache, stats):
         print(f"[parent {parent}]")
         want = parent_dacl(homes_gid if homes_gid is not None else f"<new:{args.homes_group}>",
                            admin_gid)
-        cur = midclt("filesystem.getacl", parent, True, label="getacl parent")
+        cur = call("filesystem.getacl", parent, True, label="getacl parent")
         diffs = acl_drift(cur, 0, 0, want)
         if diffs:
             print(f"    -> SET ACL ({'; '.join(diffs)})")
@@ -617,13 +968,13 @@ def run(args, dry, parent, ds, rows, csv_names, gen, cards, gcache, stats):
     # --- existing quotas (one query) ----------------------------------------
     quotas = {}
     if any(r["quota"] for r in rows):
-        for q in midclt("pool.dataset.get_quota", ds["id"], "USER", label="get quotas") or []:
+        for q in call("pool.dataset.get_quota", ds["id"], "USER", label="get quotas") or []:
             quotas[q.get("id")] = q.get("quota")
 
     # --- per-user ------------------------------------------------------------
     for r in rows:
         name = r["username"]
-        path = os.path.join(parent, name)
+        path = f"{parent}/{name}"
         print(f"[{name}]")
 
         member_of = [homes] + [gcache[g] for g in r["groups"]]
@@ -632,23 +983,24 @@ def run(args, dry, parent, ds, rows, csv_names, gen, cards, gcache, stats):
             print()
             continue
 
-        if os.path.islink(path):
-            print(f"    -> SKIP: {path} is a symlink")
+        kind = entries.get(name)
+        if kind not in (None, "DIRECTORY"):
+            print(f"    -> SKIP: {path} exists but is a {kind.lower()}, not a directory")
             stats["skipped"] += 1
             print()
             continue
 
-        exists = os.path.isdir(path)
+        exists = kind == "DIRECTORY"
         if not exists:
             print(f"    -> CREATE folder {path}")
             stats["folders_created"] += 1
             if dry:
-                print(f"      [DRY-RUN] mkdir -m 700 {path}")
+                print(f"      [DRY-RUN] filesystem.mkdir {path}")
             else:
-                os.mkdir(path, 0o700)
+                make_dir(path)
 
         want = folder_dacl(admin_gid)
-        cur = midclt("filesystem.getacl", path, True, label=f"getacl {name}") \
+        cur = call("filesystem.getacl", path, True, label=f"getacl {name}") \
             if (exists or not dry) else None
         diffs = acl_drift(cur, uid, gid, want)
         changed = False
@@ -662,9 +1014,9 @@ def run(args, dry, parent, ds, rows, csv_names, gen, cards, gcache, stats):
             have = quotas.get(uid)
             if have != r["quota"]:
                 print(f"    -> SET quota {have} -> {r['quota']} bytes")
-                midclt("pool.dataset.set_quota", ds["id"],
-                       [{"quota_type": "USER", "id": str(uid), "quota_value": r["quota"]}],
-                       dry=dry, mutate=True, label=f"quota {name}")
+                call("pool.dataset.set_quota", ds["id"],
+                     [{"quota_type": "USER", "id": str(uid), "quota_value": r["quota"]}],
+                     dry=dry, mutate=True, label=f"quota {name}")
                 stats["quotas_set"] += 1
                 changed = True
 
@@ -674,13 +1026,12 @@ def run(args, dry, parent, ds, rows, csv_names, gen, cards, gcache, stats):
         print()
 
     # --- orphans (report only) ----------------------------------------------
-    orphans = sorted(e for e in os.listdir(parent)
-                     if os.path.isdir(os.path.join(parent, e))
-                     and not e.startswith(".") and e not in csv_names)
+    orphans = sorted(n for n, t in entries.items()
+                     if t == "DIRECTORY" and not n.startswith(".") and n not in csv_names)
     if orphans:
         print("[orphans] folders with no CSV row (NOT touched):")
         for o in orphans:
-            print(f"    {os.path.join(parent, o)}")
+            print(f"    {parent}/{o}")
         print()
     return orphans
 
