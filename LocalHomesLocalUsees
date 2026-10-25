@@ -1,0 +1,689 @@
+#!/usr/bin/env python3
+"""
+provision_local_homes.py  —  private per-user folders under ONE dataset,
+driven by a CSV of LOCAL TrueNAS SCALE users and groups.
+
+What it converges to, for every row in the CSV:
+  - every group named in the CSV exists (local group, SMB-enabled)
+  - the user exists (only with --create-users) and is a member of its CSV
+    groups plus --homes-group (membership is only ever ADDED, never removed)
+  - <parent>/<username>/ exists, owned by uid:gid, with an NFSv4 ACL of:
+        owner@          FULL_CONTROL  (inherit)
+        --admin-group   FULL_CONTROL  (inherit)   [optional break-glass]
+    and NO group@ / everyone@ entries  ->  exclusive to that user
+  - optional per-user quota on the parent dataset
+
+Passphrases + 4x6 cards:
+  - New users (--create-users) get a random N-word passphrase (default 3)
+    drawn with `secrets` from the EFF large wordlist. No word is used twice
+    in a run, so every passphrase in a batch is unique.
+  - Existing users keep their password unless --reset-passwords is given.
+  - Every passphrase actually set is printed to a 4x6 (landscape) PDF, one
+    card per user, mode 0600. Store in a password manager, hand out, then shred.
+  - Dry-run produces SAMPLE cards (watermarked, passphrases not set) so you
+    can proof the layout.
+
+With --manage-parent, the parent dataset root gets:
+        owner@ (root)   FULL_CONTROL
+        --homes-group   TRAVERSE only  -> can reach own folder, can't list others
+        --admin-group   FULL_CONTROL
+
+Behaviour:
+  - Dry-run unless --apply. Read-only queries still run so the plan is real.
+  - Additive only: never deletes users, groups, folders, memberships or quotas.
+    Folders with no matching CSV row are REPORTED as orphans, not touched.
+  - ACLs/users/quotas go through midclt, so the GUI sees first-class objects.
+  - ACL changes apply to the folder itself only (non-recursive); existing
+    contents are not rewritten.
+
+CSV (header row required; '#' at start of username = comment):
+    username,full_name,groups,quota
+    alice,Alice Smith,staff;finance,500G
+    bob,Bob Jones,staff,
+    carol,,,1T
+
+Usage:
+    ./provision_local_homes.py users.csv --parent /mnt/tank/homes
+    ./provision_local_homes.py users.csv --parent /mnt/tank/homes \
+        --homes-group nas-homes --admin-group nas-admins --manage-parent
+    ./provision_local_homes.py users.csv --parent /mnt/tank/homes \
+        --create-users --apply
+    ./provision_local_homes.py users.csv --parent /mnt/tank/homes --only alice --apply
+    ./provision_local_homes.py users.csv --parent /mnt/tank/homes \
+        --reset-passwords --only bob --share-path '\\\\nas\\homes\\{user}' --apply
+
+Requires: python3 and `midclt` on PATH (run ON the TrueNAS host, as root),
+and eff_large_wordlist.txt next to this script (or --wordlist PATH):
+    https://www.eff.org/files/2016/07/18/eff_large_wordlist.txt
+The file can be used as downloaded (the dice-number column is ignored).
+No third-party Python packages are needed.
+"""
+
+import argparse
+import csv
+import datetime
+import json
+import os
+import re
+import secrets
+import subprocess
+import sys
+
+SPECIAL_TAGS = ("owner@", "group@", "everyone@")
+USERNAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_.-]{0,31}")
+GROUPNAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_.-]{0,31}")
+SIZE_RE = re.compile(r"(\d+(?:\.\d+)?)\s*([KMGTP]?)(?:i?B)?", re.I)
+UNITS = {"": 1, "K": 1024, "M": 1024**2, "G": 1024**3, "T": 1024**4, "P": 1024**5}
+
+
+# --------------------------------------------------------------------------- #
+# midclt wrapper
+# --------------------------------------------------------------------------- #
+def midclt(method, *params, job=False, dry=False, mutate=False, label=""):
+    """Run `midclt call [-job] <method> <json>...`. Mutating calls are printed,
+    not executed, in dry-run. Read-only calls always execute."""
+    cmd = ["midclt", "call"]
+    if job:
+        cmd.append("-job")
+    cmd.append(method)
+    cmd += [json.dumps(p) for p in params]
+
+    if dry and mutate:
+        shown = " ".join(json.dumps(p) for p in params)
+        print(f"      [DRY-RUN] midclt call {'-job ' if job else ''}{method} {shown}")
+        return None
+
+    try:
+        out = subprocess.run(cmd, capture_output=True, text=True, check=True)
+    except FileNotFoundError:
+        sys.exit("ERROR: midclt not found — run this ON the TrueNAS SCALE host.")
+    except subprocess.CalledProcessError as e:
+        sys.exit(f"ERROR: midclt {method} failed ({label}):\n{e.stderr.strip()}")
+
+    text = out.stdout.strip()
+    if not text:
+        return None
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        # -job prints progress lines before the final JSON result
+        try:
+            return json.loads(text.splitlines()[-1])
+        except json.JSONDecodeError:
+            return None
+
+
+_WARNED_ARGV = False
+
+
+def midclt_secret(method, *params, label=""):
+    """Call the middleware without putting secrets on a command line (visible
+    in `ps`). Uses the in-process API client; falls back to midclt with a warning."""
+    global _WARNED_ARGV
+    Client = None
+    try:
+        from truenas_api_client import Client          # SCALE 25.04+
+    except ImportError:
+        try:
+            from middlewared.client import Client      # older SCALE
+        except ImportError:
+            pass
+    if Client is not None:
+        try:
+            with Client() as c:
+                return c.call(method, *params)
+        except Exception as e:
+            sys.exit(f"ERROR: {method} failed ({label}): {e}")
+    if not _WARNED_ARGV:
+        print("    !! API client module not found; falling back to midclt "
+              "(passphrase briefly visible in the process list)")
+        _WARNED_ARGV = True
+    return midclt(method, *params, mutate=True, label=label)
+
+
+# --------------------------------------------------------------------------- #
+# Passphrases
+# --------------------------------------------------------------------------- #
+class PassphraseGen:
+    """N random words per passphrase; no word is reused within one run."""
+
+    def __init__(self, path, n_words, sep):
+        try:
+            with open(path) as f:
+                words = set()
+                for line in f:
+                    parts = line.split()
+                    if not parts:
+                        continue
+                    w = parts[-1].lower()       # EFF format: "11111<TAB>word"
+                    if re.fullmatch(r"[a-z]{3,9}", w):
+                        words.add(w)
+        except FileNotFoundError:
+            sys.exit(f"ERROR: wordlist not found: {path}")
+        if len(words) < 2048:
+            sys.exit(f"ERROR: wordlist {path} has only {len(words)} usable words (need >= 2048).")
+        self.pool = sorted(words)
+        self.n, self.sep, self.used = n_words, sep, set()
+
+    def bits(self):
+        import math
+        return self.n * math.log2(len(self.pool))
+
+    def new(self):
+        picked = []
+        while len(picked) < self.n:
+            w = secrets.choice(self.pool)
+            if w not in self.used:
+                self.used.add(w)
+                picked.append(w)
+        return self.sep.join(picked)
+
+
+# --------------------------------------------------------------------------- #
+# 4x6 cards — minimal PDF writer, standard-14 fonts, no dependencies
+# --------------------------------------------------------------------------- #
+CARD_W, CARD_H = 432, 288          # 6in x 4in landscape, in points
+MARGIN = 24
+# Average glyph widths (em fraction) for auto-fitting; Courier is exact.
+WIDTH = {"F1": 0.56, "F2": 0.60, "F3": 0.60}   # Helvetica, Helvetica-Bold, Courier-Bold
+
+
+def _pdf_str(s):
+    s = s.encode("cp1252", "replace").decode("latin-1")
+    return "(" + s.replace("\\", "\\\\").replace("(", "\\(").replace(")", "\\)") + ")"
+
+
+def _fit(text, font, want, max_w):
+    return min(want, max_w / max(1, len(text) * WIDTH[font]))
+
+
+def _card_stream(card, title, issued, sample):
+    ops = []
+
+    def text(x, y, font, size, s, gray=0.0):
+        ops.append(f"BT {gray:.2f} g /{font} {size:.1f} Tf {x:.1f} {y:.1f} Td {_pdf_str(s)} Tj ET")
+
+    inner = CARD_W - 2 * MARGIN
+    # Header band
+    ops.append(f"0.12 g 0 {CARD_H - 44} {CARD_W} 44 re f")
+    ops.append("BT 1 g /F2 15 Tf %.1f %.1f Td %s Tj ET" % (MARGIN, CARD_H - 28, _pdf_str(title)))
+    ops.append("BT 0.75 g /F1 8.5 Tf %.1f %.1f Td %s Tj ET"
+               % (CARD_W - MARGIN - 92, CARD_H - 27, _pdf_str(f"Issued {issued}")))
+
+    # Username
+    y = CARD_H - 70
+    text(MARGIN, y, "F1", 8, "USERNAME", 0.40)
+    size = _fit(card["username"], "F2", 22, inner)
+    text(MARGIN, y - 24, "F2", size, card["username"])
+    if card["full_name"] and card["full_name"] != card["username"]:
+        text(MARGIN, y - 38, "F1", 9, card["full_name"], 0.35)
+
+    # Passphrase box
+    box_y, box_h = 92, 74
+    ops.append(f"0.94 g {MARGIN} {box_y} {inner} {box_h} re f")
+    ops.append(f"0.5 w 0.55 G {MARGIN} {box_y} {inner} {box_h} re S")
+    text(MARGIN + 10, box_y + box_h - 15, "F1", 8, "PASSPHRASE", 0.40)
+    pw = card["passphrase"]
+    size = _fit(pw, "F3", 24, inner - 20)
+    pw_w = len(pw) * 0.6 * size
+    text(MARGIN + (inner - pw_w) / 2, box_y + 22, "F3", size, pw)
+    text(MARGIN + 10, box_y + 8, "F1", 7,
+         "All lowercase, typed exactly as shown including the separators.", 0.40)
+
+    # Share path
+    if card.get("share"):
+        text(MARGIN, 72, "F1", 8, "CONNECT TO", 0.40)
+        text(MARGIN + 58, 72, "F3", _fit(card["share"], "F3", 10, inner - 58), card["share"])
+
+    # Footer
+    ops.append(f"0.5 w 0.75 G {MARGIN} 50 m {CARD_W - MARGIN} 50 l S")
+    text(MARGIN, 36, "F1", 7.5,
+         "Keep this card private. Do not share it or store it with your device.", 0.30)
+    text(MARGIN, 25, "F1", 7.5,
+         "Save the passphrase in your password manager, then shred this card.", 0.30)
+
+    if sample:
+        ops.append("q 0.85 0.15 0.15 rg 1 0 0 1 0 0 cm "
+                   "BT /F2 30 Tf 0.866 0.5 -0.5 0.866 120 70 Tm (SAMPLE - NOT SET) Tj ET Q")
+    return "\n".join(ops).encode("latin-1")
+
+
+def write_cards_pdf(path, cards, title, sample):
+    issued = datetime.date.today().isoformat()
+    objs = {}  # num -> bytes
+    objs[1] = b"<< /Type /Catalog /Pages 2 0 R >>"
+    objs[3] = b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>"
+    objs[4] = b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica-Bold /Encoding /WinAnsiEncoding >>"
+    objs[5] = b"<< /Type /Font /Subtype /Type1 /BaseFont /Courier-Bold /Encoding /WinAnsiEncoding >>"
+    kids, n = [], 6
+    for card in cards:
+        stream = _card_stream(card, title, issued, sample)
+        objs[n] = b"<< /Length %d >>\nstream\n" % len(stream) + stream + b"\nendstream"
+        objs[n + 1] = (b"<< /Type /Page /Parent 2 0 R /MediaBox [0 0 %d %d] /Contents %d 0 R "
+                       b"/Resources << /Font << /F1 3 0 R /F2 4 0 R /F3 5 0 R >> >> >>"
+                       % (CARD_W, CARD_H, n))
+        kids.append(n + 1)
+        n += 2
+    objs[2] = b"<< /Type /Pages /Kids [%s] /Count %d >>" % (
+        " ".join(f"{k} 0 R" for k in kids).encode(), len(kids))
+
+    out = bytearray(b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n")
+    offsets = {}
+    for num in sorted(objs):
+        offsets[num] = len(out)
+        out += b"%d 0 obj\n" % num + objs[num] + b"\nendobj\n"
+    xref = len(out)
+    total = max(objs) + 1
+    out += b"xref\n0 %d\n0000000000 65535 f \n" % total
+    for num in range(1, total):
+        out += b"%010d 00000 n \n" % offsets[num]
+    out += b"trailer\n<< /Size %d /Root 1 0 R >>\nstartxref\n%d\n%%%%EOF\n" % (total, xref)
+
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "wb") as f:
+        f.write(out)
+    os.chmod(path, 0o600)
+
+
+# --------------------------------------------------------------------------- #
+# CSV
+# --------------------------------------------------------------------------- #
+def parse_size(raw, lineno):
+    m = SIZE_RE.fullmatch(raw.strip())
+    if not m:
+        sys.exit(f"ERROR: CSV line {lineno}: bad quota '{raw}' (use e.g. 500G, 1T)")
+    return int(float(m.group(1)) * UNITS[m.group(2).upper()])
+
+
+def load_csv(path):
+    rows, seen = [], set()
+    with open(path, newline="") as f:
+        reader = csv.DictReader(f)
+        if not reader.fieldnames or "username" not in reader.fieldnames:
+            sys.exit("ERROR: CSV needs a header row with at least a 'username' column.")
+        for lineno, row in enumerate(reader, start=2):
+            user = (row.get("username") or "").strip()
+            if not user or user.startswith("#"):
+                continue
+            if not USERNAME_RE.fullmatch(user):
+                sys.exit(f"ERROR: CSV line {lineno}: invalid username '{user}'")
+            if user in seen:
+                sys.exit(f"ERROR: CSV line {lineno}: duplicate username '{user}'")
+            seen.add(user)
+
+            groups = [g.strip() for g in (row.get("groups") or "").split(";") if g.strip()]
+            for g in groups:
+                if not GROUPNAME_RE.fullmatch(g):
+                    sys.exit(f"ERROR: CSV line {lineno}: invalid group '{g}'")
+
+            quota_raw = (row.get("quota") or "").strip()
+            rows.append({
+                "username": user,
+                "full_name": (row.get("full_name") or "").strip() or user,
+                "groups": groups,
+                "quota": parse_size(quota_raw, lineno) if quota_raw else None,
+            })
+    if not rows:
+        sys.exit("ERROR: CSV contains no users.")
+    return rows
+
+
+# --------------------------------------------------------------------------- #
+# Groups and users
+# --------------------------------------------------------------------------- #
+def ensure_group(name, dry, cache, stats):
+    if name in cache:
+        return cache[name]
+    res = midclt("group.query", [["group", "=", name]], label=f"query group {name}")
+    if res:
+        grp = res[0]
+        if grp.get("local") is False:
+            print(f"  [group {name}] WARNING: exists but is not a local group")
+        print(f"  [group {name}] OK (gid {grp.get('gid')})")
+    else:
+        print(f"  [group {name}] CREATE")
+        created = midclt("group.create", {"name": name, "smb": True},
+                         dry=dry, mutate=True, label=f"create group {name}")
+        stats["groups_created"] += 1
+        if dry:
+            grp = {"id": None, "gid": None, "group": name, "_planned": True}
+        else:
+            gid_lookup = created if isinstance(created, int) else (created or {}).get("id")
+            grp = midclt("group.query", [["id", "=", gid_lookup]])[0]
+    cache[name] = grp
+    return grp
+
+
+def _card(row, passphrase, args):
+    share = args.share_path.replace("{user}", row["username"]) if args.share_path else ""
+    return {"username": row["username"], "full_name": row["full_name"],
+            "passphrase": passphrase, "share": share}
+
+
+def ensure_user(row, group_objs, args, dry, cards, gen, stats):
+    """Return (uid, gid) for the folder owner, or (None, None) if unavailable."""
+    name = row["username"]
+    res = midclt("user.query", [["username", "=", name]], label=f"query user {name}")
+    user = res[0] if res else None
+
+    if user is None:
+        if not args.create_users:
+            print(f"    -> MISSING user (not created; pass --create-users)")
+            stats["users_missing"] += 1
+            return None, None
+        print(f"    -> CREATE user {name} ({row['full_name']}) with new passphrase")
+        passphrase = gen.new()
+        payload = {
+            "username": name,
+            "full_name": row["full_name"],
+            "group_create": True,
+            "groups": [g["id"] for g in group_objs if g.get("id") is not None],
+            "home": "/var/empty",
+            "shell": "/usr/sbin/nologin",
+            "smb": True,
+            "password": passphrase,
+        }
+        if dry:
+            print(f"      [DRY-RUN] midclt call user.create "
+                  f"{json.dumps({**payload, 'password': '<redacted>'})}")
+            created = None
+        else:
+            created = midclt_secret("user.create", payload, label=f"create user {name}")
+        stats["users_created"] += 1
+        cards.append(_card(row, passphrase, args))
+        if dry:
+            return "<new>", "<new>"
+        user_id = created if isinstance(created, int) else created.get("id")
+        user = midclt("user.query", [["id", "=", user_id]])[0]
+        return user["uid"], user["group"]["bsdgrp_gid"]
+
+    if user.get("builtin"):
+        print(f"    -> SKIP: '{name}' is a builtin system account")
+        stats["skipped"] += 1
+        return None, None
+    if user.get("local") is False:
+        print(f"    -> SKIP: '{name}' is a directory-service user, not local")
+        stats["skipped"] += 1
+        return None, None
+
+    have = list(user.get("groups") or [])
+    missing = [g for g in group_objs if g.get("id") is None or g["id"] not in have]
+    if missing:
+        names = ", ".join(g["group"] for g in missing)
+        print(f"    -> ADD to groups: {names}")
+        new_ids = have + [g["id"] for g in missing if g.get("id") is not None]
+        midclt("user.update", user["id"], {"groups": new_ids},
+               dry=dry, mutate=True, label=f"update groups {name}")
+        stats["memberships_added"] += len(missing)
+    else:
+        print(f"    -> user OK (uid {user['uid']})")
+
+    if args.reset_passwords:
+        print(f"    -> RESET password to new passphrase")
+        passphrase = gen.new()
+        if dry:
+            print(f"      [DRY-RUN] midclt call user.update {user['id']} "
+                  f'{{"password": "<redacted>"}}')
+        else:
+            midclt_secret("user.update", user["id"], {"password": passphrase},
+                          label=f"reset password {name}")
+        stats["passwords_reset"] += 1
+        cards.append(_card(row, passphrase, args))
+    return user["uid"], user["group"]["bsdgrp_gid"]
+
+
+# --------------------------------------------------------------------------- #
+# ACLs
+# --------------------------------------------------------------------------- #
+def ace(tag, perm, flags, id_=None):
+    return {"tag": tag, "id": None if tag in SPECIAL_TAGS else id_, "type": "ALLOW",
+            "perms": {"BASIC": perm}, "flags": {"BASIC": flags}}
+
+
+def folder_dacl(admin_gid):
+    dacl = [ace("owner@", "FULL_CONTROL", "INHERIT")]
+    if admin_gid is not None:
+        dacl.append(ace("GROUP", "FULL_CONTROL", "INHERIT", admin_gid))
+    return dacl
+
+
+def parent_dacl(homes_gid, admin_gid):
+    dacl = [ace("owner@", "FULL_CONTROL", "NOINHERIT")]
+    if homes_gid is not None:
+        dacl.append(ace("GROUP", "TRAVERSE", "NOINHERIT", homes_gid))
+    if admin_gid is not None:
+        dacl.append(ace("GROUP", "FULL_CONTROL", "NOINHERIT", admin_gid))
+    return dacl
+
+
+def norm_ace(a):
+    tag = a.get("tag")
+    return (tag, None if tag in SPECIAL_TAGS else a.get("id"), a.get("type"),
+            json.dumps(a.get("perms"), sort_keys=True),
+            json.dumps(a.get("flags"), sort_keys=True))
+
+
+def acl_drift(current, uid, gid, dacl):
+    """Return a list of human-readable differences (empty = in sync)."""
+    if current is None:
+        return ["no ACL yet"]
+    diffs = []
+    if current.get("acltype") not in ("NFS4", "NFSV4"):
+        diffs.append(f"acltype {current.get('acltype')} -> NFS4")
+    if current.get("uid") != uid:
+        diffs.append(f"owner uid {current.get('uid')} -> {uid}")
+    if current.get("gid") != gid:
+        diffs.append(f"owner gid {current.get('gid')} -> {gid}")
+    if [norm_ace(a) for a in current.get("acl", [])] != [norm_ace(a) for a in dacl]:
+        diffs.append("ACE list differs")
+    return diffs
+
+
+def apply_acl(path, uid, gid, dacl, dry, label):
+    payload = {
+        "path": path, "dacl": dacl, "uid": uid, "gid": gid, "acltype": "NFS4",
+        "options": {"stripacl": False, "recursive": False,
+                    "traverse": False, "canonicalize": True},
+    }
+    midclt("filesystem.setacl", payload, job=True, dry=dry, mutate=True, label=label)
+
+
+# --------------------------------------------------------------------------- #
+# Main
+# --------------------------------------------------------------------------- #
+def main():
+    ap = argparse.ArgumentParser(description="Provision private per-user folders from a CSV.")
+    ap.add_argument("csv", help="CSV of users (username,full_name,groups,quota)")
+    ap.add_argument("--parent", required=True,
+                    help="Mountpoint of the parent dataset, e.g. /mnt/tank/homes")
+    ap.add_argument("--homes-group", default="nas-homes",
+                    help="Group every CSV user joins; gets TRAVERSE on the parent (default: nas-homes)")
+    ap.add_argument("--admin-group", help="Optional break-glass group with FULL_CONTROL on every folder")
+    ap.add_argument("--manage-parent", action="store_true",
+                    help="Also converge the parent dataset root's ACL (traverse-only for members)")
+    ap.add_argument("--create-users", action="store_true",
+                    help="Create missing local users with a random passphrase")
+    ap.add_argument("--reset-passwords", action="store_true",
+                    help="Also give EXISTING users (in scope) a new passphrase. Combine with --only.")
+    ap.add_argument("--words", type=int, default=3,
+                    help="Words per passphrase (default 3)")
+    ap.add_argument("--sep", default="-", help="Word separator (default '-')")
+    ap.add_argument("--wordlist",
+                    default=os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                         "eff_large_wordlist.txt"),
+                    help="Wordlist file (default: eff_large_wordlist.txt next to this script)")
+    ap.add_argument("--cards-out",
+                    help="PDF of 4x6 credential cards (mode 0600). "
+                         "Default: homes-cards-<timestamp>.pdf (or -SAMPLE in dry-run)")
+    ap.add_argument("--card-title", default="Network Storage Access",
+                    help="Heading printed on each card")
+    ap.add_argument("--share-path",
+                    help=r"Optional connect-to line; {user} is replaced, e.g. '\\nas\homes\{user}'")
+    ap.add_argument("--only", metavar="USER", help="Process only this username")
+    ap.add_argument("--apply", action="store_true", help="Execute changes (default is dry-run)")
+    args = ap.parse_args()
+
+    dry = not args.apply
+    parent = os.path.normpath(args.parent)
+
+    if not dry and os.geteuid() != 0:
+        sys.exit("ERROR: --apply must run as root (folder creation needs it).")
+    if args.words < 2:
+        sys.exit("ERROR: --words must be at least 2.")
+    gen = PassphraseGen(args.wordlist, args.words, args.sep)
+    stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    cards_out = args.cards_out or f"homes-cards-{stamp}{'-SAMPLE' if dry else ''}.pdf"
+
+    rows = load_csv(args.csv)
+    csv_names = {r["username"] for r in rows}
+    if args.only:
+        rows = [r for r in rows if r["username"] == args.only]
+        if not rows:
+            sys.exit(f"ERROR: --only '{args.only}' matched no CSV row.")
+
+    print(f"=== local homes provisioner [{'DRY-RUN' if dry else 'APPLY'}] parent={parent} ===\n")
+
+    # --- pre-flight: parent must be an NFSv4 dataset mountpoint -------------
+    ds = midclt("pool.dataset.query", [["mountpoint", "=", parent]], label="query parent")
+    if not ds:
+        sys.exit(f"ERROR: {parent} is not the mountpoint of a dataset.")
+    ds = ds[0]
+    acltype = str((ds.get("acltype") or {}).get("value", ds.get("acltype"))).upper()
+    if "NFS" not in acltype:
+        sys.exit(f"ERROR: dataset {ds['id']} acltype is {acltype}; set it to NFSv4 first.")
+    if not os.path.isdir(parent):
+        sys.exit(f"ERROR: {parent} is not a directory on this host.")
+
+    stats = {k: 0 for k in ("groups_created", "users_created", "users_missing",
+                            "memberships_added", "passwords_reset", "skipped",
+                            "folders_created", "acls_set", "quotas_set", "ok")}
+    cards = []
+    gcache = {}
+    print(f"passphrases: {args.words} words from {len(gen.pool)} "
+          f"(~{gen.bits():.0f} bits each), separator '{args.sep}'\n")
+    try:
+        orphans = run(args, dry, parent, ds, rows, csv_names, gen, cards, gcache, stats)
+    finally:
+        # Always emit cards for passphrases already set, even if a later step failed.
+        if cards:
+            write_cards_pdf(cards_out, cards, args.card_title, sample=dry)
+            label = "SAMPLE card(s) — passphrases NOT set" if dry else "credential card(s)"
+            print(f"!! {len(cards)} {label} written to {os.path.abspath(cards_out)} (0600).")
+            if not dry:
+                print("   Store in a password manager, hand out, then shred the PDF "
+                      "and any printouts.\n")
+            else:
+                print()
+
+    print("=== summary ===")
+    for k, v in stats.items():
+        print(f"  {k.replace('_', ' '):<18} {v}")
+    print(f"  {'orphans':<18} {len(orphans)}")
+    if dry:
+        print("\n(DRY-RUN — nothing was changed. Re-run with --apply to execute.)")
+
+
+def run(args, dry, parent, ds, rows, csv_names, gen, cards, gcache, stats):
+
+    # --- groups --------------------------------------------------------------
+    print("[groups]")
+    homes = ensure_group(args.homes_group, dry, gcache, stats)
+    admin = ensure_group(args.admin_group, dry, gcache, stats) if args.admin_group else None
+    for r in rows:
+        for g in r["groups"]:
+            ensure_group(g, dry, gcache, stats)
+    print()
+
+    homes_gid = homes.get("gid")
+    admin_gid = admin.get("gid") if admin else None
+    if admin is not None and admin_gid is None:
+        admin_gid = f"<new:{args.admin_group}>"  # dry-run placeholder
+
+    # --- parent ACL ----------------------------------------------------------
+    if args.manage_parent:
+        print(f"[parent {parent}]")
+        want = parent_dacl(homes_gid if homes_gid is not None else f"<new:{args.homes_group}>",
+                           admin_gid)
+        cur = midclt("filesystem.getacl", parent, True, label="getacl parent")
+        diffs = acl_drift(cur, 0, 0, want)
+        if diffs:
+            print(f"    -> SET ACL ({'; '.join(diffs)})")
+            apply_acl(parent, 0, 0, want, dry, "setacl parent")
+            stats["acls_set"] += 1
+        else:
+            print("    -> OK")
+        print()
+
+    # --- existing quotas (one query) ----------------------------------------
+    quotas = {}
+    if any(r["quota"] for r in rows):
+        for q in midclt("pool.dataset.get_quota", ds["id"], "USER", label="get quotas") or []:
+            quotas[q.get("id")] = q.get("quota")
+
+    # --- per-user ------------------------------------------------------------
+    for r in rows:
+        name = r["username"]
+        path = os.path.join(parent, name)
+        print(f"[{name}]")
+
+        member_of = [homes] + [gcache[g] for g in r["groups"]]
+        uid, gid = ensure_user(r, member_of, args, dry, cards, gen, stats)
+        if uid is None:
+            print()
+            continue
+
+        if os.path.islink(path):
+            print(f"    -> SKIP: {path} is a symlink")
+            stats["skipped"] += 1
+            print()
+            continue
+
+        exists = os.path.isdir(path)
+        if not exists:
+            print(f"    -> CREATE folder {path}")
+            stats["folders_created"] += 1
+            if dry:
+                print(f"      [DRY-RUN] mkdir -m 700 {path}")
+            else:
+                os.mkdir(path, 0o700)
+
+        want = folder_dacl(admin_gid)
+        cur = midclt("filesystem.getacl", path, True, label=f"getacl {name}") \
+            if (exists or not dry) else None
+        diffs = acl_drift(cur, uid, gid, want)
+        changed = False
+        if diffs:
+            print(f"    -> SET ACL owner {uid}:{gid} ({'; '.join(diffs)})")
+            apply_acl(path, uid, gid, want, dry, f"setacl {name}")
+            stats["acls_set"] += 1
+            changed = True
+
+        if r["quota"] is not None:
+            have = quotas.get(uid)
+            if have != r["quota"]:
+                print(f"    -> SET quota {have} -> {r['quota']} bytes")
+                midclt("pool.dataset.set_quota", ds["id"],
+                       [{"quota_type": "USER", "id": str(uid), "quota_value": r["quota"]}],
+                       dry=dry, mutate=True, label=f"quota {name}")
+                stats["quotas_set"] += 1
+                changed = True
+
+        if not changed and exists:
+            print("    -> folder OK")
+            stats["ok"] += 1
+        print()
+
+    # --- orphans (report only) ----------------------------------------------
+    orphans = sorted(e for e in os.listdir(parent)
+                     if os.path.isdir(os.path.join(parent, e))
+                     and not e.startswith(".") and e not in csv_names)
+    if orphans:
+        print("[orphans] folders with no CSV row (NOT touched):")
+        for o in orphans:
+            print(f"    {os.path.join(parent, o)}")
+        print()
+    return orphans
+
+
+if __name__ == "__main__":
+    main()
