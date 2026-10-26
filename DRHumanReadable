@@ -1,0 +1,1136 @@
+#!/usr/bin/env python3
+"""
+TrueNAS Configuration Archiver + Infrastructure Runbook
+=========================================================
+Pulls configuration AND health/status data from the TrueNAS REST API to produce
+a comprehensive, human-readable Markdown runbook plus an encrypted config backup.
+
+Part 1: Configuration Archive  — what is configured
+Part 2: Deep Dive Appendix     — what shape it's in right now
+
+Redaction can be toggled at runtime or via TRUENAS_REDACT=false env var.
+Unredacted output includes ALL secrets in plain text for disaster recovery.
+
+Requirements:  pip3 install requests   (or: sudo apt install python3-requests)
+Usage:         python3 truenas_runbook.py
+"""
+
+import requests, json, datetime, os, sys, time, getpass
+from urllib.parse import urljoin
+from pathlib import Path
+from collections import defaultdict
+
+import urllib3
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  CONFIGURATION — edit these or use environment variables
+# ═══════════════════════════════════════════════════════════════════════════════
+TRUENAS_HOST    = os.environ.get("TRUENAS_HOST", "")
+TRUENAS_APIKEY  = os.environ.get("TRUENAS_APIKEY", "")
+VERIFY_SSL      = os.environ.get("TRUENAS_VERIFY_SSL", "false").lower() == "true"
+OUTPUT_DIR      = os.environ.get("TRUENAS_OUTPUT_DIR", ".")
+DOWNLOAD_BACKUP = True
+DEEP_DIVE       = True    # set False to skip the appendix and just do config
+REDACT_ENABLED  = True    # toggled at runtime or via TRUENAS_REDACT=false
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  PART 1 — CONFIGURATION SECTIONS
+#  (label, endpoint, key_filter, display_mode)
+# ═══════════════════════════════════════════════════════════════════════════════
+SECTIONS = [
+    # ── System ────────────────────────────────────────────────────────────────
+    ("System Information",       "/system/info",              None, "kv"),
+    ("General Settings",         "/system/general",           None, "kv"),
+    ("Advanced Settings",        "/system/advanced",          None, "kv"),
+    ("NTP Servers",              "/system/ntpserver",         None, "table"),
+    ("Boot Environments",        "/bootenv",
+     ["id","name","active","activated","created","rawspace"], "table"),
+    ("Tunables",                 "/tunable",                  None, "table"),
+    ("Certificates",             "/certificate",
+     ["id","name","issuer","DN","from","until","key_type","key_length"], "table"),
+    ("Certificate Authorities",  "/certificateauthority",
+     ["id","name","issuer","DN","from","until"], "table"),
+
+    # ── Network ───────────────────────────────────────────────────────────────
+    ("Network Configuration",    "/network/configuration",    None, "kv"),
+    ("Network Interfaces",       "/interface",
+     ["id","name","type","state","aliases","ipv4_dhcp","ipv6_auto","mtu",
+      "lag_protocol","lag_ports","vlan_parent_interface","vlan_tag","description"], "table"),
+    ("Static Routes",            "/staticroute",              None, "table"),
+    ("IPMI Configuration",       "/ipmi",                     None, "kv"),
+
+    # ── Storage ───────────────────────────────────────────────────────────────
+    ("Storage Pools",            "/pool",
+     ["id","name","guid","status","path","healthy","is_decrypted","topology"], "cards"),
+    ("Datasets",                 "/pool/dataset",
+     ["id","name","type","used","available","compression",
+      "recordsize","quota","reservation","refquota","refreservation",
+      "readonly","acltype","casesensitivity","encrypted",
+      "deduplication","sync","snapdir","copies"], "table"),
+    ("Disks",                    "/disk",
+     ["identifier","name","serial","size","model","type",
+      "rotationrate","advpowermgmt","hddstandby","pool"], "table"),
+    ("Snapshot Tasks",           "/pool/snapshottask",        None, "table"),
+    ("Replication Tasks",        "/replication",              None, "cards"),
+    ("Scrub Tasks",              "/pool/scrub",               None, "table"),
+    ("Resilver Priority",        "/pool/resilver",            None, "kv"),
+
+    # ── Sharing ───────────────────────────────────────────────────────────────
+    ("SMB Shares",               "/sharing/smb",
+     ["id","name","path","enabled","home","ro","browsable","recyclebin",
+      "guestok","abe","acl","streams","durablehandle","comment"], "table"),
+    ("NFS Shares",               "/sharing/nfs",              None, "cards"),
+    ("iSCSI Global Config",      "/iscsi/global",             None, "kv"),
+    ("iSCSI Portals",            "/iscsi/portal",             None, "table"),
+    ("iSCSI Initiators",         "/iscsi/initiator",          None, "table"),
+    ("iSCSI Targets",            "/iscsi/target",             None, "cards"),
+    ("iSCSI Extents",            "/iscsi/extent",             None, "table"),
+    ("iSCSI Target-Extent Maps", "/iscsi/targetextent",       None, "table"),
+    ("WebDAV Shares",            "/sharing/webdav",           None, "table"),
+
+    # ── Services ──────────────────────────────────────────────────────────────
+    ("Services",                 "/service",
+     ["id","service","enable","state"], "table"),
+    ("SMB Configuration",        "/smb",                      None, "kv"),
+    ("NFS Configuration",        "/nfs",                      None, "kv"),
+    ("SSH Configuration",        "/ssh",                      None, "kv"),
+    ("S3 Configuration",         "/s3",                       None, "kv"),
+    ("FTP Configuration",        "/ftp",                      None, "kv"),
+    ("SNMP Configuration",       "/snmp",                     None, "kv"),
+    ("UPS Configuration",        "/ups",                      None, "kv"),
+
+    # ── Directory Services ────────────────────────────────────────────────────
+    ("Active Directory",         "/activedirectory",          None, "kv"),
+    ("LDAP",                     "/ldap",                     None, "kv"),
+    ("Kerberos Realms",          "/kerberos/realm",           None, "table"),
+    ("Kerberos Keytabs",         "/kerberos/keytab",
+     ["id","name"], "table"),
+
+    # ── Users & Groups ────────────────────────────────────────────────────────
+    ("Users",                    "/user",
+     ["id","uid","username","full_name","builtin","locked",
+      "shell","home","smb","email","sudo_commands"], "table"),
+    ("Groups",                   "/group",
+     ["id","gid","name","builtin","smb","sudo_commands","users"], "table"),
+
+    # ── Tasks ─────────────────────────────────────────────────────────────────
+    ("Cron Jobs",                "/cronjob",                  None, "cards"),
+    ("Cloud Sync Tasks",         "/cloudsync",                None, "cards"),
+    ("Rsync Tasks",              "/rsynctask",                None, "cards"),
+    ("SMART Tests",              "/smart/test",               None, "table"),
+
+    # ── Virtualisation / Apps ─────────────────────────────────────────────────
+    ("Virtual Machines",         "/vm",                       None, "cards"),
+    ("Apps (Chart Releases)",    "/chart/release",
+     ["id","name","status","human_version","update_available","portal_urls"], "table"),
+
+    # ── Alerts & Reporting ────────────────────────────────────────────────────
+    ("Active Alerts",            "/alert/list",               None, "cards"),
+    ("Alert Services",           "/alertservice",             None, "table"),
+    ("Reporting Config",         "/reporting",                None, "kv"),
+
+    # ── System Security ───────────────────────────────────────────────────────
+    ("Two-Factor Auth",          "/auth/twofactor",           None, "kv"),
+    ("Privileges",               "/privilege",                None, "table"),
+    ("API Keys",                 "/api_key",
+     ["id","name","created_at"], "table"),
+
+    # ── Legacy ────────────────────────────────────────────────────────────────
+    ("Jails",                    "/jail",                     None, "auto"),
+    ("Plugins",                  "/plugin",                   None, "auto"),
+]
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  REDACTION
+# ═══════════════════════════════════════════════════════════════════════════════
+REDACT_FIELDS = {
+    "password", "secret", "token", "apikey", "api_key", "bindpw",
+    "unixhash", "smbhash", "nt_hash", "lm_hash", "private_key",
+    "secret_seed", "csr", "privatekey",
+    "encryption_password", "encryption_salt",
+    "pass", "secret_key", "client_secret", "refresh_token",
+    "access_key_id", "secret_access_key",
+}
+
+REDACT_SUBSTRINGS = (
+    "password", "secret", "token", "private_key", "apikey", "api_key",
+    "credential", "passphrase", "auth_key", "hmac",
+)
+
+SKIP_KEYS = {"id", "url", "uri"}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  HELPERS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def should_redact(key):
+    k = key.lower()
+    if k in REDACT_FIELDS:
+        return True
+    for trigger in REDACT_SUBSTRINGS:
+        if trigger in k:
+            return True
+    return False
+
+
+def redact(obj):
+    if not REDACT_ENABLED:
+        return obj
+    if isinstance(obj, dict):
+        return {k: ("***REDACTED***" if should_redact(k) else redact(v))
+                for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [redact(i) for i in obj]
+    return obj
+
+
+def filter_keys(data, keys):
+    if keys is None or not isinstance(data, list):
+        return data
+    return [{k: row.get(k) for k in keys if k in row} for row in data if isinstance(row, dict)]
+
+
+def fetch(session, base, endpoint):
+    url = urljoin(base.rstrip("/") + "/", "api/v2.0" + endpoint)
+    try:
+        r = session.get(url, timeout=30)
+        if r.status_code == 404:
+            return None, "endpoint not available (404)"
+        if r.status_code == 401:
+            return None, "authentication failed (401)"
+        r.raise_for_status()
+        try:
+            return r.json(), None
+        except ValueError:
+            # Non-JSON body; ValueError is the portable parent of JSONDecodeError
+            return r.text[:500], None
+    except Exception as e:
+        return None, str(e)
+
+
+def post(session, base, endpoint, payload=None):
+    url = urljoin(base.rstrip("/") + "/", "api/v2.0" + endpoint)
+    try:
+        r = session.post(url, json=payload or {}, timeout=60)
+        if r.status_code == 404:
+            return None, "endpoint not available (404)"
+        r.raise_for_status()
+        try:
+            return r.json(), None
+        except ValueError:
+            # Non-JSON body; ValueError is the portable parent of JSONDecodeError
+            return r.text[:500], None
+    except Exception as e:
+        return None, str(e)
+
+
+def wait_job(session, base, job_id, timeout=60, interval=2):
+    """Poll /core/get_jobs until a job finishes. Returns (result, error)."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        jobs, err = post(session, base, "/core/get_jobs", [[["id", "=", job_id]]])
+        if err:
+            return None, err
+        job = jobs[0] if isinstance(jobs, list) and jobs else None
+        if not isinstance(job, dict):
+            return None, f"job {job_id} not found"
+        state = job.get("state")
+        if state == "SUCCESS":
+            return job.get("result"), None
+        if state in ("FAILED", "ABORTED"):
+            return None, str(job.get("error") or state)
+        time.sleep(interval)
+    return None, f"job {job_id} timed out after {timeout}s"
+
+
+def prompt_config():
+    global TRUENAS_HOST, TRUENAS_APIKEY, OUTPUT_DIR, REDACT_ENABLED
+
+    # ── Check env vars first (for unattended runs) ────────────────────────────
+    env_redact = os.environ.get("TRUENAS_REDACT", "").lower()
+    if env_redact == "false":
+        REDACT_ENABLED = False
+
+    if not TRUENAS_HOST:
+        TRUENAS_HOST = input("TrueNAS URL (e.g. https://10.0.0.5): ").strip()
+    if not TRUENAS_APIKEY:
+        TRUENAS_APIKEY = getpass.getpass("API Key: ").strip()
+    if not OUTPUT_DIR or OUTPUT_DIR == ".":
+        default = str(Path.home() / "Documents")
+        choice = input(f"Output directory [{default}]: ").strip()
+        OUTPUT_DIR = choice if choice else default
+
+    # ── Redaction prompt (skip if already set via env) ────────────────────────
+    if env_redact:
+        if not REDACT_ENABLED:
+            print("\n  ⚠  TRUENAS_REDACT=false — redaction DISABLED via environment\n")
+        return
+
+    print("")
+    print("  ╔══════════════════════════════════════════════════════════╗")
+    print("  ║  REDACTION OPTIONS                                      ║")
+    print("  ║                                                          ║")
+    print("  ║  1. Redacted     — passwords/keys replaced with ***     ║")
+    print("  ║                    Safe to share, store, or email.       ║")
+    print("  ║                                                          ║")
+    print("  ║  2. Unredacted   — ALL secrets in plain text            ║")
+    print("  ║                    For fire safe / disaster recovery.    ║")
+    print("  ║                                                          ║")
+    print("  ║  ⚠  Unredacted output contains credentials, API keys,  ║")
+    print("  ║     encryption passwords, and service secrets.           ║")
+    print("  ║     Store on encrypted media or in a physical safe.      ║")
+    print("  ╚══════════════════════════════════════════════════════════╝")
+    choice = input("\n  Select [1]: ").strip()
+
+    if choice == "2":
+        print("")
+        print("  ┌──────────────────────────────────────────────────────┐")
+        print("  │  You are about to generate a document containing     │")
+        print("  │  ALL credentials and secrets in PLAIN TEXT.          │")
+        print("  │                                                      │")
+        print("  │  This includes:                                      │")
+        print("  │    • User password hashes                            │")
+        print("  │    • Cloud storage access keys                       │")
+        print("  │    • Encryption passwords and salts                  │")
+        print("  │    • API tokens and service credentials              │")
+        print("  │    • Active Directory bind passwords                 │")
+        print("  │    • Private keys and certificates                   │")
+        print("  └──────────────────────────────────────────────────────┘")
+        confirm = input("\n  Type 'yes' to confirm, anything else to cancel: ").strip().lower()
+        if confirm == "yes":
+            REDACT_ENABLED = False
+            print("\n  → Redaction DISABLED — output will contain plain text secrets")
+            print("  → Filename will be tagged UNREDACTED for identification\n")
+        else:
+            REDACT_ENABLED = True
+            print("\n  → Cancelled. Keeping redaction enabled.\n")
+    else:
+        REDACT_ENABLED = True
+        print("\n  → Redaction enabled — secrets will be masked\n")
+
+
+def fmt_val(v, max_len=80):
+    if v is None or v == "" or v == []:
+        return "—"
+    if isinstance(v, bool):
+        return "Yes" if v else "No"
+    if isinstance(v, dict):
+        if "value" in v and "source" in v:
+            return fmt_val(v["value"], max_len)
+        if "parsed" in v and "rawvalue" in v:
+            return fmt_val(v["parsed"], max_len)
+        if len(v) <= 3:
+            parts = [f"{k}: {fmt_val(val, 30)}" for k, val in v.items()]
+            return " · ".join(parts)
+        return f"[{len(v)} fields]"
+    if isinstance(v, list):
+        if all(isinstance(i, (str, int, float, bool)) for i in v):
+            joined = ", ".join(str(i) for i in v)
+            return joined[:max_len] + ("…" if len(joined) > max_len else "")
+        if all(isinstance(i, dict) for i in v):
+            return f"[{len(v)} items]"
+        return str(v)[:max_len]
+    s = str(v)
+    return s[:max_len] + ("…" if len(s) > max_len else "")
+
+
+def fmt_bytes(n):
+    try:
+        n = int(n)
+    except (TypeError, ValueError):
+        return str(n)
+    for unit in ("B", "KB", "MB", "GB", "TB", "PB"):
+        if abs(n) < 1024:
+            return f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} EB"
+
+
+def pretty_key(k):
+    return k.replace("_", " ").replace(".", " > ").title()
+
+
+def pipe_escape(s):
+    return str(s).replace("|", "\\|")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  FORMATTERS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def format_kv(data):
+    if not isinstance(data, dict):
+        return f"```\n{data}\n```\n"
+    lines = ["| Setting | Value |", "| :--- | :--- |"]
+    for k, v in data.items():
+        if k.lower() in SKIP_KEYS:
+            continue
+        lines.append(f"| **{pipe_escape(pretty_key(k))}** | {pipe_escape(fmt_val(v))} |")
+    return "\n".join(lines) + "\n"
+
+
+def format_table(records):
+    if not records or not isinstance(records[0], dict):
+        return None
+    headers = [k for k in records[0].keys() if k.lower() not in SKIP_KEYS]
+    if not headers:
+        headers = list(records[0].keys())
+    lines = [
+        "| " + " | ".join(pretty_key(h) for h in headers) + " |",
+        "| " + " | ".join(":---" for _ in headers) + " |",
+    ]
+    for row in records:
+        cells = [pipe_escape(fmt_val(row.get(h), 60)) for h in headers]
+        lines.append("| " + " | ".join(cells) + " |")
+    return "\n".join(lines) + "\n"
+
+
+def format_cards(records):
+    if not records:
+        return None
+    parts = []
+    for i, row in enumerate(records):
+        if not isinstance(row, dict):
+            parts.append(f"- {row}")
+            continue
+        title = row.get("name") or row.get("id") or row.get("service") or f"Item {i+1}"
+        parts.append(f"### {pipe_escape(fmt_val(title, 120))}\n")
+        parts.append("| Setting | Value |")
+        parts.append("| :--- | :--- |")
+        for k, v in row.items():
+            if k.lower() in SKIP_KEYS:
+                continue
+            parts.append(f"| **{pipe_escape(pretty_key(k))}** | {pipe_escape(fmt_val(v))} |")
+        parts.append("")
+    return "\n".join(parts) + "\n"
+
+
+def format_auto(data):
+    if isinstance(data, dict):
+        return format_kv(data)
+    if isinstance(data, list) and data:
+        if isinstance(data[0], dict):
+            sample = data[0]
+            nested = sum(1 for v in sample.values() if isinstance(v, (dict, list)))
+            if nested > len(sample) * 0.4:
+                return format_cards(data)
+            return format_table(data)
+    return f"```\n{json.dumps(data, indent=2)}\n```\n"
+
+
+def format_section(data, mode):
+    if isinstance(data, list) and not data:
+        return "*No entries configured.*\n"
+    if mode == "kv":
+        return format_kv(data)
+    elif mode == "table":
+        if isinstance(data, list) and data and isinstance(data[0], dict):
+            return format_table(data) or format_auto(data)
+        return format_kv(data) if isinstance(data, dict) else format_auto(data)
+    elif mode == "cards":
+        if isinstance(data, list) and data and isinstance(data[0], dict):
+            return format_cards(data) or format_auto(data)
+        return format_kv(data) if isinstance(data, dict) else format_auto(data)
+    else:
+        return format_auto(data)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  PART 2 — DEEP DIVE APPENDIX BUILDERS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def appendix_pool_health(session, base):
+    """Pool status, capacity, topology detail, and vdev health."""
+    lines = ["## A1 — Pool Health & Capacity\n"]
+    pools, err = fetch(session, base, "/pool")
+    if err:
+        lines.append(f"*Skipped — {err}*\n")
+        return "\n".join(lines)
+    if not pools:
+        lines.append("*No pools found.*\n")
+        return "\n".join(lines)
+
+    for pool in pools:
+        name = pool.get("name", "unknown")
+        lines.append(f"### Pool: {name}\n")
+        lines.append("| Property | Value |")
+        lines.append("| :--- | :--- |")
+        lines.append(f"| **Status** | {pool.get('status', '—')} |")
+        lines.append(f"| **Healthy** | {'Yes' if pool.get('healthy') else 'No'} |")
+        lines.append(f"| **GUID** | {pool.get('guid', '—')} |")
+        lines.append(f"| **Path** | {pool.get('path', '—')} |")
+        lines.append(f"| **Encrypted** | {fmt_val(pool.get('is_decrypted', '—'))} |")
+        scan = pool.get("scan")
+        if isinstance(scan, dict):
+            scan_func = scan.get("function", "—")
+            scan_state = scan.get("state", "—")
+            scan_end = scan.get("end_time", scan.get("end", "—"))
+            scan_errs = scan.get("errors", 0)
+            lines.append(f"| **Last Scan** | {scan_func} — {scan_state} (ended {fmt_val(scan_end)}, {scan_errs} errors) |")
+        else:
+            lines.append(f"| **Last Scan** | {fmt_val(scan)} |")
+
+        topo = pool.get("topology", {})
+        for vdev_type in ("data", "cache", "log", "spare", "special", "dedup", "metadata"):
+            vdevs = topo.get(vdev_type, [])
+            if not vdevs:
+                continue
+            lines.append(f"\n**{vdev_type.upper()} vdevs:**\n")
+            for vdev in vdevs:
+                vname = vdev.get("name", vdev.get("type", "unknown"))
+                vstatus = vdev.get("status", "—")
+                lines.append(f"- **{vname}** — status: {vstatus}")
+                children = vdev.get("children", [])
+                for child in children:
+                    cname = child.get("device", child.get("name", "—"))
+                    cstatus = child.get("status", "—")
+                    cstats = child.get("stats", {})
+                    read_errs = cstats.get("read_errors", 0)
+                    write_errs = cstats.get("write_errors", 0)
+                    cksum_errs = cstats.get("checksum_errors", 0)
+                    lines.append(f"  - `{cname}` — {cstatus} "
+                                 f"(R:{read_errs} W:{write_errs} C:{cksum_errs} errors)")
+        lines.append("")
+    return "\n".join(lines) + "\n"
+
+
+def appendix_smart(session, base):
+    """Latest SMART results per disk."""
+    lines = ["## A2 — Disk SMART Health\n"]
+    disks, err = fetch(session, base, "/disk")
+    if err:
+        lines.append(f"*Skipped — {err}*\n")
+        return "\n".join(lines)
+    if not disks:
+        lines.append("*No disks found.*\n")
+        return "\n".join(lines)
+
+    lines.append("| Disk | Model | Serial | Size | Pool | Temp |")
+    lines.append("| :--- | :--- | :--- | :--- | :--- | :--- |")
+
+    for disk in disks:
+        name = disk.get("name", "—")
+        temp_val = disk.get("temperature")
+        temp = f"{temp_val}°C" if temp_val else "—"
+        lines.append(
+            f"| {name} "
+            f"| {pipe_escape(fmt_val(disk.get('model','—'), 30))} "
+            f"| {disk.get('serial','—')} "
+            f"| {fmt_bytes(disk.get('size', 0))} "
+            f"| {disk.get('pool','—') or '—'} "
+            f"| {temp} |"
+        )
+
+    smart_results, serr = fetch(session, base, "/smart/test/results")
+    if not serr and smart_results and isinstance(smart_results, list):
+        lines.append("\n### Recent SMART Test Results\n")
+        lines.append("| Disk | Test Type | Status | Remaining | Lifetime Hours | LBA of First Error |")
+        lines.append("| :--- | :--- | :--- | :--- | :--- | :--- |")
+        for result in smart_results:
+            if not isinstance(result, dict):
+                continue
+            disk_name = result.get("disk", "—")
+            tests = result.get("tests", [])
+            for test in (tests[:5] if tests else []):
+                if not isinstance(test, dict):
+                    continue
+                lines.append(
+                    f"| {disk_name} "
+                    f"| {fmt_val(test.get('type', test.get('description', '—')), 15)} "
+                    f"| {fmt_val(test.get('status', '—'), 25)} "
+                    f"| {fmt_val(test.get('remaining', '—'))} "
+                    f"| {fmt_val(test.get('lifetime', test.get('power_on_hours', '—')))} "
+                    f"| {fmt_val(test.get('lba_of_first_error', '—'))} |"
+                )
+    lines.append("")
+    return "\n".join(lines) + "\n"
+
+
+def appendix_encryption(session, base):
+    """Dataset encryption summary."""
+    lines = ["## A3 — Encryption Status\n"]
+    datasets, err = fetch(session, base, "/pool/dataset")
+    if err:
+        lines.append(f"*Skipped — {err}*\n")
+        return "\n".join(lines)
+
+    encrypted = [d for d in datasets
+                 if isinstance(d, dict) and fmt_val(d.get("encrypted")) == "Yes"]
+    if not encrypted:
+        lines.append("*No encrypted datasets found.*\n")
+        return "\n".join(lines)
+
+    lines.append("| Dataset | Algorithm | Key Format | Locked | Key Loaded |")
+    lines.append("| :--- | :--- | :--- | :--- | :--- |")
+    for ds in encrypted:
+        lines.append(
+            f"| {pipe_escape(fmt_val(ds.get('name','—')))} "
+            f"| {fmt_val(ds.get('encryption_algorithm','—'))} "
+            f"| {fmt_val(ds.get('key_format','—'))} "
+            f"| {fmt_val(ds.get('locked','—'))} "
+            f"| {fmt_val(ds.get('key_loaded','—'))} |"
+        )
+
+    pools, _ = fetch(session, base, "/pool")
+    if pools:
+        for pool in pools:
+            pool_name = pool.get("name")
+            if not pool_name:
+                continue
+            # encryption_summary is a job-based method: it takes the dataset id as a
+            # bare value and returns a job ID that must be polled for the result.
+            summary, serr = post(session, base,
+                                 "/pool/dataset/encryption_summary",
+                                 pool_name)
+            if not serr and isinstance(summary, int):
+                summary, serr = wait_job(session, base, summary, timeout=60)
+            if not serr and summary and isinstance(summary, list):
+                lines.append(f"\n**Encryption summary for pool `{pool_name}`:**\n")
+                lines.append("| Dataset | Key Format | Key Present | Locked |")
+                lines.append("| :--- | :--- | :--- | :--- |")
+                for entry in summary:
+                    if isinstance(entry, dict):
+                        lines.append(
+                            f"| {pipe_escape(fmt_val(entry.get('name','—')))} "
+                            f"| {fmt_val(entry.get('key_format','—'))} "
+                            f"| {fmt_val(entry.get('key_present_on_system','—'))} "
+                            f"| {fmt_val(entry.get('locked','—'))} |"
+                        )
+    lines.append("")
+    return "\n".join(lines) + "\n"
+
+
+def appendix_cloud_credentials(session, base):
+    """Cloud storage credentials inventory (redacted unless disabled)."""
+    lines = ["## A4 — Cloud Credentials Inventory\n"]
+    creds, err = fetch(session, base, "/cloudsync/credentials")
+    if err:
+        lines.append(f"*Skipped — {err}*\n")
+        return "\n".join(lines)
+    if not creds:
+        lines.append("*No cloud credentials configured.*\n")
+        return "\n".join(lines)
+
+    creds = redact(creds)
+    lines.append("| ID | Name | Provider |")
+    lines.append("| :--- | :--- | :--- |")
+    for cred in creds:
+        if not isinstance(cred, dict):
+            continue
+        lines.append(
+            f"| {cred.get('id','—')} "
+            f"| {pipe_escape(fmt_val(cred.get('name','—')))} "
+            f"| {pipe_escape(fmt_val(cred.get('provider','—')))} |"
+        )
+    lines.append("")
+    return "\n".join(lines) + "\n"
+
+
+def appendix_iscsi_topology(session, base):
+    """iSCSI relationship map: portals -> targets -> extents."""
+    lines = ["## A5 — iSCSI Topology Map\n"]
+
+    portals, _ = fetch(session, base, "/iscsi/portal")
+    targets, _ = fetch(session, base, "/iscsi/target")
+    extents, _ = fetch(session, base, "/iscsi/extent")
+    maps, _ = fetch(session, base, "/iscsi/targetextent")
+    initiators, _ = fetch(session, base, "/iscsi/initiator")
+
+    if not targets:
+        lines.append("*No iSCSI targets configured.*\n")
+        return "\n".join(lines)
+
+    portal_map = {}
+    if portals:
+        for p in portals:
+            listen = p.get("listen", [])
+            addrs = ", ".join(f"{l.get('ip','*')}:{l.get('port',3260)}" for l in listen) if listen else "—"
+            portal_map[p.get("id")] = addrs
+
+    extent_map = {}
+    if extents:
+        for e in extents:
+            extent_map[e.get("id")] = {
+                "name": e.get("name", "—"),
+                "type": e.get("type", "—"),
+                "path": e.get("path", e.get("disk", "—")),
+                "enabled": e.get("enabled", True),
+            }
+
+    target_extents = defaultdict(list)
+    if maps:
+        for m in maps:
+            eid = m.get("extent")
+            ext = extent_map.get(eid, {"name": f"extent-{eid}", "type": "—", "path": "—"})
+            target_extents[m.get("target")].append({"lun": m.get("lunid", "—"), **ext})
+
+    initiator_map = {}
+    if initiators:
+        for ini in initiators:
+            initiator_map[ini.get("id")] = {
+                "comment": ini.get("comment", "—"),
+                "initiators": ini.get("initiators", []),
+            }
+
+    for tgt in targets:
+        tid = tgt.get("id")
+        lines.append(f"### Target: {pipe_escape(tgt.get('name','—'))}\n")
+
+        tgt_groups = tgt.get("groups", [])
+        if tgt_groups:
+            lines.append("**Portal / Initiator Groups:**\n")
+            lines.append("| Portal | Listen Addresses | Initiator Group | Auth Method |")
+            lines.append("| :--- | :--- | :--- | :--- |")
+            for grp in tgt_groups:
+                portal_id = grp.get("portal")
+                init_id = grp.get("initiator")
+                auth = grp.get("authmethod", "—")
+                portal_addr = portal_map.get(portal_id, f"portal-{portal_id}")
+                init_info = initiator_map.get(init_id, {"comment": f"group-{init_id}"})
+                lines.append(
+                    f"| {portal_id} | {pipe_escape(portal_addr)} "
+                    f"| {pipe_escape(fmt_val(init_info.get('comment','—')))} "
+                    f"| {auth} |"
+                )
+            lines.append("")
+
+        texts = target_extents.get(tid, [])
+        if texts:
+            lines.append("**Mapped Extents:**\n")
+            lines.append("| LUN | Extent Name | Type | Path / Device | Enabled |")
+            lines.append("| :--- | :--- | :--- | :--- | :--- |")
+            for ext in texts:
+                lines.append(
+                    f"| {ext.get('lun','—')} "
+                    f"| {pipe_escape(ext.get('name','—'))} "
+                    f"| {ext.get('type','—')} "
+                    f"| {pipe_escape(fmt_val(ext.get('path','—'), 50))} "
+                    f"| {'Yes' if ext.get('enabled') else 'No'} |"
+                )
+            lines.append("")
+        else:
+            lines.append("*No extents mapped to this target.*\n")
+
+    return "\n".join(lines) + "\n"
+
+
+def appendix_update_status(session, base):
+    """Current update train and available updates."""
+    lines = ["## A6 — Update & Patch Status\n"]
+
+    trains, terr = fetch(session, base, "/update/get_trains")
+    if not terr and trains and isinstance(trains, dict):
+        trains = redact(trains)
+        current = trains.get("current", "—")
+        lines.append(f"**Current train:** `{current}`\n")
+        available = trains.get("trains", {})
+        if available:
+            lines.append("| Train | Description |")
+            lines.append("| :--- | :--- |")
+            for tname, tinfo in available.items():
+                desc = tinfo.get("description", "—") if isinstance(tinfo, dict) else "—"
+                marker = " **(active)**" if tname == current else ""
+                lines.append(f"| `{tname}`{marker} | {pipe_escape(fmt_val(desc, 80))} |")
+            lines.append("")
+
+    update, uerr = post(session, base, "/update/check_available")
+    if not uerr and update and isinstance(update, dict):
+        update = redact(update)
+        status = update.get("status", "—")
+        lines.append(f"**Update status:** {status}\n")
+        if status == "AVAILABLE":
+            changes = update.get("changes", [])
+            if changes:
+                lines.append("**Pending changes:**\n")
+                lines.append("| Operation | Old | New |")
+                lines.append("| :--- | :--- | :--- |")
+                for ch in changes[:30]:
+                    if isinstance(ch, dict):
+                        lines.append(
+                            f"| {ch.get('operation','—')} "
+                            f"| {pipe_escape(fmt_val(ch.get('old','—'), 40))} "
+                            f"| {pipe_escape(fmt_val(ch.get('new','—'), 40))} |"
+                        )
+                if len(changes) > 30:
+                    lines.append(f"\n*... and {len(changes)-30} more changes.*\n")
+                lines.append("")
+        else:
+            lines.append("*System is up to date.*\n")
+    elif uerr:
+        lines.append(f"*Update check skipped — {uerr}*\n")
+
+    return "\n".join(lines) + "\n"
+
+
+def appendix_app_detail(session, base):
+    """Detailed config for each app / chart release."""
+    lines = ["## A7 — Application Detail\n"]
+    apps, err = fetch(session, base, "/chart/release")
+    if err:
+        lines.append(f"*Skipped — {err}*\n")
+        return "\n".join(lines)
+    if not apps:
+        lines.append("*No apps installed.*\n")
+        return "\n".join(lines)
+
+    for app in apps:
+        if not isinstance(app, dict):
+            continue
+        app = redact(app)
+        name = app.get("name", "unknown")
+        lines.append(f"### {pipe_escape(name)}\n")
+        lines.append("| Property | Value |")
+        lines.append("| :--- | :--- |")
+
+        for k in ("status", "human_version", "update_available", "catalog",
+                   "catalog_train", "portal_urls", "used_ports"):
+            if k in app:
+                lines.append(f"| **{pretty_key(k)}** | {pipe_escape(fmt_val(app[k]))} |")
+
+        chart_config = app.get("config", {})
+        if isinstance(chart_config, dict):
+            image = chart_config.get("image", {})
+            if isinstance(image, dict):
+                repo = image.get("repository", "—")
+                tag = image.get("tag", "—")
+                lines.append(f"| **Image** | `{repo}:{tag}` |")
+
+            network = chart_config.get("network", chart_config.get("hostNetwork"))
+            if network is not None:
+                lines.append(f"| **Network** | {pipe_escape(fmt_val(network))} |")
+
+            env = chart_config.get("env", chart_config.get("extraEnvVars", {}))
+            if env:
+                env = redact(env) if isinstance(env, dict) else env
+                lines.append(f"| **Environment** | {pipe_escape(fmt_val(env))} |")
+
+        volumes = chart_config.get("ixVolumes", []) if isinstance(chart_config, dict) else []
+        if volumes:
+            vol_str = ", ".join(str(v.get("hostPath", v)) if isinstance(v, dict) else str(v)
+                                for v in volumes[:5])
+            lines.append(f"| **Host Volumes** | {pipe_escape(fmt_val(vol_str, 80))} |")
+
+        lines.append("")
+    return "\n".join(lines) + "\n"
+
+
+def appendix_audit(session, base):
+    """Recent audit log entries."""
+    lines = ["## A8 — Audit Log (Recent Activity)\n"]
+
+    audit, err = post(session, base, "/audit/query",
+                      {"query-filters": [], "query-options": {"limit": 50, "order_by": ["-message_timestamp"]}})
+    if err:
+        audit, err2 = fetch(session, base, "/audit/query")
+        if err2:
+            lines.append(f"*Audit log not available — {err}*\n")
+            return "\n".join(lines)
+
+    if not audit:
+        lines.append("*No audit entries returned.*\n")
+        return "\n".join(lines)
+
+    audit = redact(audit)
+
+    if isinstance(audit, list) and audit and isinstance(audit[0], dict):
+        lines.append("| Timestamp | Service | Event | Username | Address | Message |")
+        lines.append("| :--- | :--- | :--- | :--- | :--- | :--- |")
+        for entry in audit[:50]:
+            lines.append(
+                f"| {fmt_val(entry.get('message_timestamp','—'), 20)} "
+                f"| {fmt_val(entry.get('service','—'), 15)} "
+                f"| {fmt_val(entry.get('event','—'), 20)} "
+                f"| {fmt_val(entry.get('username','—'), 15)} "
+                f"| {fmt_val(entry.get('address','—'), 15)} "
+                f"| {pipe_escape(fmt_val(entry.get('event_data', entry.get('message','')), 50))} |"
+            )
+        lines.append("")
+    else:
+        lines.append(f"```\n{json.dumps(audit, indent=2)[:3000]}\n```\n")
+
+    return "\n".join(lines) + "\n"
+
+
+def appendix_dataset_quotas(session, base):
+    """Quota utilisation for datasets with quotas set."""
+    lines = ["## A9 — Dataset Quota Utilisation\n"]
+    datasets, err = fetch(session, base, "/pool/dataset")
+    if err:
+        lines.append(f"*Skipped — {err}*\n")
+        return "\n".join(lines)
+
+    rows = []
+    for ds in datasets:
+        if not isinstance(ds, dict):
+            continue
+        quota = fmt_val(ds.get("quota", "—"))
+        refquota = fmt_val(ds.get("refquota", "—"))
+        if quota in ("—", "0", "None", "0B", "0") and refquota in ("—", "0", "None", "0B", "0"):
+            continue
+        rows.append({
+            "name": fmt_val(ds.get("name", "—")),
+            "used": fmt_val(ds.get("used", "—")),
+            "available": fmt_val(ds.get("available", "—")),
+            "quota": quota,
+            "refquota": refquota,
+        })
+
+    if not rows:
+        lines.append("*No datasets with quotas configured.*\n")
+        return "\n".join(lines)
+
+    lines.append("| Dataset | Used | Available | Quota | Ref Quota |")
+    lines.append("| :--- | :--- | :--- | :--- | :--- |")
+    for r in rows:
+        lines.append(
+            f"| {pipe_escape(r['name'])} "
+            f"| {r['used']} "
+            f"| {r['available']} "
+            f"| {r['quota']} "
+            f"| {r['refquota']} |"
+        )
+    lines.append("")
+    return "\n".join(lines) + "\n"
+
+
+def appendix_system_dataset(session, base):
+    """System dataset and syslog configuration."""
+    lines = ["## A10 — System Dataset & Syslog\n"]
+
+    sysds, err = fetch(session, base, "/systemdataset")
+    if not err and sysds:
+        lines.append("### System Dataset\n")
+        lines.append(format_kv(sysds))
+
+    syslog, err2 = fetch(session, base, "/system/advanced")
+    if not err2 and isinstance(syslog, dict):
+        lines.append("### Syslog Configuration\n")
+        syslog_keys = {
+            "syslogserver", "sysloglevel", "syslog_transport", "syslog_tls_certificate",
+            "consolemsg", "serialconsole", "serialport", "serialspeed",
+            "motd", "fqdn_syslog", "sed_user", "kernel_extra_options",
+        }
+        filtered = {k: v for k, v in syslog.items() if k in syslog_keys}
+        if filtered:
+            lines.append(format_kv(redact(filtered)))
+        else:
+            lines.append("*No syslog-specific settings found in advanced config.*\n")
+
+    return "\n".join(lines) + "\n"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  CONFIG BACKUP DOWNLOAD
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def looks_like_tar(b):
+    """POSIX tar files carry the 'ustar' magic at byte offset 257."""
+    return isinstance(b, (bytes, bytearray)) and len(b) > 512 and b[257:262] == b"ustar"
+
+
+def download_config(session, base):
+    """
+    Download the config DB backup, handling both API generations:
+      - Modern SCALE: core.download returns [job_id, url]; fetch the URL
+      - Legacy:       POST /config/save streams the tar directly
+    Raises on failure; validates the result is actually a tar.
+    """
+    root = base.rstrip("/") + "/"
+
+    # ── Modern flow: core.download ────────────────────────────────────────────
+    try:
+        r = session.post(urljoin(root, "api/v2.0/core/download"),
+                         json=["config.save", [{"secretseed": True}], "config.tar"],
+                         timeout=60)
+        if r.ok:
+            resp = r.json()
+            if isinstance(resp, list) and len(resp) == 2:
+                _job_id, dl_path = resp
+                r2 = session.get(urljoin(root, str(dl_path).lstrip("/")), timeout=120)
+                r2.raise_for_status()
+                if looks_like_tar(r2.content):
+                    return r2.content
+    except Exception:
+        pass  # fall through to legacy
+
+    # ── Legacy flow: direct /config/save ──────────────────────────────────────
+    r = session.post(urljoin(root, "api/v2.0/config/save"),
+                     json={"secretseed": True}, timeout=120)
+    r.raise_for_status()
+    if looks_like_tar(r.content):
+        return r.content
+
+    raise RuntimeError(
+        f"API returned {len(r.content)} bytes that are not a tar archive "
+        f"(starts with {r.content[:24]!r}). This TrueNAS version may require "
+        f"a different download flow — save the config manually from the UI."
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  MAIN
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def main():
+    prompt_config()
+    Path(OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
+
+    ts       = datetime.datetime.now().strftime("%Y-%m-%d_%H%M")
+    label    = "UNREDACTED" if not REDACT_ENABLED else "redacted"
+    md_path  = Path(OUTPUT_DIR) / f"truenas_runbook_{ts}_{label}.md"
+    tar_path = Path(OUTPUT_DIR) / f"truenas_backup_{ts}.tar"
+
+    session = requests.Session()
+    session.headers.update({"Authorization": f"Bearer {TRUENAS_APIKEY}"})
+    session.verify = VERIFY_SSL
+
+    # Connectivity check
+    print(f"Connecting to {TRUENAS_HOST} ...")
+    sys_info, err = fetch(session, TRUENAS_HOST, "/system/info")
+    if err:
+        print(f"  ✗ Connection failed: {err}")
+        sys.exit(1)
+    hostname = sys_info.get("hostname", "unknown") if isinstance(sys_info, dict) else "unknown"
+    version  = sys_info.get("version", "unknown") if isinstance(sys_info, dict) else "unknown"
+    print(f"  ✓ Connected — {hostname} running {version}\n")
+
+    # ══════════════════════════════════════════════════════════════════════════
+    #  Build document
+    # ══════════════════════════════════════════════════════════════════════════
+    doc = []
+    doc.append("# TrueNAS Infrastructure Runbook\n")
+    doc.append(f"> **Host:** {hostname}  ")
+    doc.append(f"> **Version:** {version}  ")
+    doc.append(f"> **Generated:** {ts}  ")
+    doc.append(f"> **Redaction:** {'Enabled — secrets masked' if REDACT_ENABLED else 'DISABLED — plain text secrets included'}  ")
+
+    if not REDACT_ENABLED:
+        doc.append("")
+        doc.append("---")
+        doc.append("")
+        doc.append("> **⚠️  WARNING: THIS DOCUMENT CONTAINS UNREDACTED CREDENTIALS**  ")
+        doc.append("> ")
+        doc.append("> This file includes passwords, API keys, encryption secrets, and  ")
+        doc.append("> private keys in **plain text**. It is intended for secure offline  ")
+        doc.append("> storage only (encrypted drive, fire safe, safety deposit box).  ")
+        doc.append("> ")
+        doc.append("> **Do not share electronically. Do not store in cloud services.  ")
+        doc.append("> Do not commit to version control.**  ")
+
+    doc.append("")
+    doc.append("---\n")
+
+    # ── Master table of contents ──────────────────────────────────────────────
+    doc.append("## Table of Contents\n")
+    doc.append("### Part 1 — Configuration Archive\n")
+    for i, (lbl, _, _, _) in enumerate(SECTIONS, 1):
+        anchor = lbl.lower().replace(" ", "-").replace("/","").replace("(","").replace(")","")
+        doc.append(f"{i}. [{lbl}](#{anchor})")
+
+    if DEEP_DIVE:
+        doc.append("\n### Part 2 — Deep Dive Appendix\n")
+        appendix_titles = [
+            "A1 — Pool Health & Capacity",
+            "A2 — Disk SMART Health",
+            "A3 — Encryption Status",
+            "A4 — Cloud Credentials Inventory",
+            "A5 — iSCSI Topology Map",
+            "A6 — Update & Patch Status",
+            "A7 — Application Detail",
+            "A8 — Audit Log (Recent Activity)",
+            "A9 — Dataset Quota Utilisation",
+            "A10 — System Dataset & Syslog",
+        ]
+        for title in appendix_titles:
+            anchor = title.lower().replace(" ", "-").replace("—","").replace("&","").replace("/","")
+            anchor = anchor.replace("(","").replace(")","").replace("  ", "-")
+            doc.append(f"- [{title}](#{anchor})")
+
+    doc.append("\n---\n")
+
+    # ══════════════════════════════════════════════════════════════════════════
+    #  Part 1 — Configuration Archive
+    # ══════════════════════════════════════════════════════════════════════════
+    doc.append("# Part 1 — Configuration Archive\n")
+
+    success = 0
+    skipped = 0
+
+    for lbl, endpoint, key_filter, mode in SECTIONS:
+        print(f"  [{success+skipped+1:2d}/{len(SECTIONS)}] {lbl:<30s} {endpoint}")
+        data, err = fetch(session, TRUENAS_HOST, endpoint)
+
+        doc.append(f"## {lbl}\n")
+
+        if err:
+            doc.append(f"*Skipped — {err}*\n")
+            skipped += 1
+            continue
+
+        data = redact(data)
+        data = filter_keys(data, key_filter)
+        doc.append(format_section(data, mode))
+        success += 1
+
+    print(f"\n  Part 1 complete: {success} sections, {skipped} skipped\n")
+
+    # ══════════════════════════════════════════════════════════════════════════
+    #  Part 2 — Deep Dive Appendix
+    # ══════════════════════════════════════════════════════════════════════════
+    if DEEP_DIVE:
+        doc.append("---\n")
+        doc.append("# Part 2 — Deep Dive Appendix\n")
+        doc.append("> These sections reflect the **live state** of the system at generation time.")
+        doc.append("> They complement the configuration archive with health, status, and diagnostic data.\n")
+
+        appendix_funcs = [
+            ("Pool Health & Capacity",        appendix_pool_health),
+            ("Disk SMART Health",             appendix_smart),
+            ("Encryption Status",             appendix_encryption),
+            ("Cloud Credentials Inventory",   appendix_cloud_credentials),
+            ("iSCSI Topology Map",            appendix_iscsi_topology),
+            ("Update & Patch Status",         appendix_update_status),
+            ("Application Detail",            appendix_app_detail),
+            ("Audit Log",                     appendix_audit),
+            ("Dataset Quota Utilisation",     appendix_dataset_quotas),
+            ("System Dataset & Syslog",       appendix_system_dataset),
+        ]
+
+        for title, func in appendix_funcs:
+            print(f"  [appendix] {title}")
+            try:
+                doc.append(func(session, TRUENAS_HOST))
+            except Exception as e:
+                doc.append(f"## {title}\n\n*Error generating section: {e}*\n")
+
+        print(f"\n  Part 2 complete: {len(appendix_funcs)} appendix sections\n")
+
+    # ══════════════════════════════════════════════════════════════════════════
+    #  Write output
+    # ══════════════════════════════════════════════════════════════════════════
+    md_path.write_text("\n".join(doc), encoding="utf-8")
+    print(f"  ✓ Runbook saved → {md_path}")
+
+    if not REDACT_ENABLED:
+        print("  ⚠  OUTPUT CONTAINS PLAIN TEXT SECRETS — store securely")
+
+    # Download config backup
+    if DOWNLOAD_BACKUP:
+        print("  Downloading config backup (with secret seed) ...")
+        try:
+            content = download_config(session, TRUENAS_HOST)
+            tar_path.write_bytes(content)
+            print(f"  ✓ Backup saved  → {tar_path}  ({len(content)//1024} KB)")
+        except Exception as e:
+            print(f"  ✗ Backup failed: {e}")
+
+    print("\nDone.\n")
+
+
+if __name__ == "__main__":
+    main()
