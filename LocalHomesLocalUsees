@@ -63,7 +63,7 @@ CSV (header row required; '#' at start of username = comment):
     bob,Bob Jones,staff,
     carol,,,1T
 
-Usage:
+Usage (or just run it with no arguments for a guided, step-by-step setup):
     export TRUENAS_API_KEY=...            # or --api-key-file ~/.truenas-key
     ./provision_local_homes.py users.csv --host nas.lan --fingerprint AB:CD:... \
         --parent /mnt/tank/homes
@@ -222,9 +222,10 @@ class WebSocket:
 # TrueNAS middleware client
 # --------------------------------------------------------------------------- #
 class ApiError(Exception):
-    def __init__(self, msg, errno=None):
+    def __init__(self, msg, errno=None, lost=False):
         super().__init__(msg)
         self.errno = errno
+        self.lost = lost          # True = the connection dropped or timed out
 
 
 def _norm_fp(fp):
@@ -256,11 +257,18 @@ class TrueNAS:
         self.fingerprint = _norm_fp(fingerprint) if fingerprint else None
         self.timeout = timeout
         self.ids = itertools.count(1)
+        self.requested_protocol = protocol
+        self._creds = None
+        self._open()
+
+    def _open(self):
+        protocol = self.requested_protocol
+        host, port = self.host, self.port
         order = ["jsonrpc", "legacy"] if protocol == "auto" else [protocol]
         last = None
         for proto in order:
             try:
-                self.ws = WebSocket(host, port, self.ENDPOINTS[proto], ctx, timeout)
+                self.ws = WebSocket(host, port, self.ENDPOINTS[proto], self.ctx, self.timeout)
             except HandshakeError as e:
                 last = e
                 if protocol == "auto" and e.status in (400, 403, 404, 405):
@@ -291,7 +299,44 @@ class TrueNAS:
     def close(self):
         self.ws.close()
 
+    def reconnect(self):
+        """Open a fresh connection (same certificate pin) and log in again."""
+        try:
+            self.ws.close()
+        except OSError:
+            pass
+        try:
+            self._open()
+        except OSError as e:
+            raise ApiError(f"could not reconnect to {self.host}:{self.port}: {e}", lost=True)
+        if self._creds:
+            self.login(*self._creds)
+
+    def ensure_alive(self):
+        """Cheap check before work that follows a long pause for user input.
+        Idle connections are often dropped by the NAS or the network; if so,
+        reconnect. Only a read-only ping is ever retried, never a change."""
+        try:
+            self.ws.sock.settimeout(min(10, self.timeout))   # a ping answers instantly
+            self._rpc("core.ping", [])
+            self.ws.sock.settimeout(self.timeout)
+            return
+        except ApiError as e:
+            if not e.lost:
+                raise
+        print("    (the connection to the NAS went idle and was dropped - reconnecting)")
+        self.reconnect()
+
     def _rpc(self, method, params):
+        try:
+            return self._rpc_once(method, params)
+        except ApiError:
+            raise
+        except (OSError, ValueError) as e:         # timeout, reset, closed, garbage
+            what = "timed out" if isinstance(e, socket.timeout) else f"failed ({e})"
+            raise ApiError(f"connection to the NAS {what} during {method}", lost=True) from None
+
+    def _rpc_once(self, method, params):
         n = next(self.ids)
         if self.protocol == "jsonrpc":
             self.ws.send_text(json.dumps({"jsonrpc": "2.0", "id": n,
@@ -345,9 +390,17 @@ class TrueNAS:
             ok = isinstance(res, dict) and res.get("response_type") == "SUCCESS"
         if not ok:
             raise ApiError("API key login failed (wrong key, revoked key, or user lacks access)")
+        self._creds = (api_key, api_user)     # kept in memory only, for reconnects
 
 
 _API = None
+SHOW_DRY_DETAIL = True      # the wizard turns this off to keep its review readable
+
+
+def dry_detail(text):
+    """Print the exact API call a dry run would make (command-line mode only)."""
+    if SHOW_DRY_DETAIL:
+        print(text)
 
 
 def call(method, *params, job=False, dry=False, mutate=False, label=""):
@@ -355,13 +408,13 @@ def call(method, *params, job=False, dry=False, mutate=False, label=""):
     dry-run. Read-only calls always execute."""
     if dry and mutate:
         shown = " ".join(json.dumps(p) for p in params)
-        print(f"      [DRY-RUN] {method} {shown}")
+        dry_detail(f"      [DRY-RUN] {method} {shown}")
         return None
     try:
         return _API.call(method, *params, job=job)
     except ApiError as e:
         if label:
-            raise ApiError(f"{e} ({label})", e.errno) from None
+            raise ApiError(f"{e} ({label})", e.errno, e.lost) from None
         raise
 
 
@@ -635,7 +688,7 @@ def ensure_user(row, group_objs, args, dry, cards, gen, stats):
             "password": passphrase,
         }
         if dry:
-            print(f"      [DRY-RUN] user.create "
+            dry_detail(f"      [DRY-RUN] user.create "
                   f"{json.dumps({**payload, 'password': '<redacted>'})}")
             created = None
         else:
@@ -673,7 +726,7 @@ def ensure_user(row, group_objs, args, dry, cards, gen, stats):
         print(f"    -> RESET password to new passphrase")
         passphrase = gen.new()
         if dry:
-            print(f"      [DRY-RUN] user.update {user['id']} "
+            dry_detail(f"      [DRY-RUN] user.update {user['id']} "
                   f'{{"password": "<redacted>"}}')
         else:
             call("user.update", user["id"], {"password": passphrase},
@@ -787,7 +840,8 @@ def build_parser():
                                         "server rejects the older key-login call")
     con.add_argument("--protocol", choices=("auto", "jsonrpc", "legacy"), default="auto",
                      help="API endpoint: /api/current (jsonrpc), /websocket (legacy), or auto")
-    con.add_argument("--timeout", type=float, default=30, help="Socket timeout in seconds")
+    con.add_argument("--timeout", type=float, default=60,
+                     help="Seconds to wait for the NAS to answer (default 60)")
 
     ap.add_argument("--homes-group", default="nas-homes",
                     help="Group every CSV user joins; gets TRAVERSE on the parent (default: nas-homes)")
@@ -813,13 +867,17 @@ def build_parser():
                     help=r"Optional connect-to line; {user} is replaced, e.g. '\\nas\homes\{user}'")
     ap.add_argument("--only", metavar="USER", help="Process only this username")
     ap.add_argument("--apply", action="store_true", help="Execute changes (default is dry-run)")
+    ap.add_argument("--wizard", action="store_true",
+                    help="Step-by-step guided mode (also starts when run with no arguments)")
+    ap.add_argument("--config", help="Settings file the wizard reads and saves "
+                                     "(default: ~/.config/provision_local_homes.json)")
     return ap
 
 
 def connect(args):
     host, port = split_host(args.host)
     if not host:
-        sys.exit("ERROR: --host is required (or set TRUENAS_HOST).")
+        sys.exit("ERROR: --host is required (or set TRUENAS_HOST, or run with --wizard).")
     pinned = bool(args.fingerprint) or args.show_fingerprint
     if args.fingerprint and len(_norm_fp(args.fingerprint)) != 64:
         sys.exit("ERROR: --fingerprint must be a SHA-256 fingerprint (64 hex digits).")
@@ -836,9 +894,75 @@ def connect(args):
     return api, host, port
 
 
+def start_session(api, api_key, api_user, host):
+    """Log in and label the connection for the run header. Raises ApiError."""
+    api.login(api_key, api_user)
+    try:
+        version = api.call("system.version")
+    except ApiError:
+        version = "unknown version"
+    api.label = f"{host} ({version}, {api.protocol} API)"
+
+
+CHANGE_KEYS = ("groups_created", "users_created", "memberships_added", "passwords_reset",
+               "folders_created", "acls_set", "quotas_set")
+
+
+def execute(args, dry, parent, rows, csv_names, gen, cards_out, sample_cards=True):
+    """One provisioning pass on the open connection. Returns (ok, stats, orphans)."""
+    print(f"=== local homes provisioner [{'DRY-RUN' if dry else 'APPLY'}] "
+          f"{_API.label} parent={parent} ===\n")
+    stats = {k: 0 for k in ("groups_created", "users_created", "users_missing",
+                            "memberships_added", "passwords_reset", "skipped",
+                            "folders_created", "acls_set", "quotas_set", "ok")}
+    cards, gcache, orphans, failed = [], {}, [], None
+    if gen is not None:
+        print(f"passphrases: {gen.n} words from {len(gen.pool)} "
+              f"(~{gen.bits():.0f} bits each), separator '{gen.sep}'\n")
+    try:
+        orphans = run(args, dry, parent, rows, csv_names, gen, cards, gcache, stats)
+    except ApiError as e:
+        failed = e
+    finally:
+        # Always emit cards for passphrases already set, even if a later step failed.
+        if cards and (sample_cards or not dry):
+            write_cards_pdf(cards_out, cards, args.card_title, sample=dry)
+            label = "SAMPLE card(s) — passphrases NOT set" if dry else "credential card(s)"
+            print(f"!! {len(cards)} {label} written to {os.path.abspath(cards_out)} (0600).")
+            if not dry:
+                print("   Store in a password manager, hand out, then shred the PDF "
+                      "and any printouts.\n")
+            else:
+                print()
+
+    if failed:
+        print(f"ERROR: {failed}\n(stopped; changes made before this point were kept)",
+              file=sys.stderr)
+        return False, stats, orphans
+
+    print("=== summary ===")
+    for k, v in stats.items():
+        print(f"  {k.replace('_', ' '):<18} {v}")
+    print(f"  {'orphans':<18} {len(orphans)}")
+    return True, stats, orphans
+
+
+def needs_passphrases(args):
+    return args.create_users or args.reset_passwords
+
+
+def default_cards_out(dry):
+    stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    return f"homes-cards-{stamp}{'-SAMPLE' if dry else ''}.pdf"
+
+
 def main(argv=None):
     global _API
+    argv = sys.argv[1:] if argv is None else list(argv)
     args = build_parser().parse_args(argv)
+
+    if args.wizard or (not argv and sys.stdin.isatty() and sys.stdout.isatty()):
+        sys.exit(wizard(args))
 
     if args.show_fingerprint:
         api, host, port = connect(args)
@@ -850,16 +974,16 @@ def main(argv=None):
         return
 
     if not args.csv or not args.parent:
-        sys.exit("ERROR: the CSV argument and --parent are required.")
+        sys.exit("ERROR: the CSV argument and --parent are required "
+                 "(or run with --wizard to be asked step by step).")
     dry = not args.apply
     parent = os.path.normpath(args.parent).replace("\\", "/")
     if not parent.startswith("/mnt/"):
         sys.exit(f"ERROR: --parent must be a path on the NAS under /mnt/, got {parent}")
     if args.words < 2:
         sys.exit("ERROR: --words must be at least 2.")
-    gen = PassphraseGen(args.wordlist, args.words, args.sep)
-    stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-    cards_out = args.cards_out or f"homes-cards-{stamp}{'-SAMPLE' if dry else ''}.pdf"
+    gen = PassphraseGen(args.wordlist, args.words, args.sep) if needs_passphrases(args) else None
+    cards_out = args.cards_out or default_cards_out(dry)
 
     rows = load_csv(args.csv)
     csv_names = {r["username"] for r in rows}
@@ -871,54 +995,505 @@ def main(argv=None):
     api_key = read_api_key(args)
     _API, host, port = connect(args)
     try:
-        _API.login(api_key, args.api_user)
+        start_session(_API, api_key, args.api_user, host)
     except ApiError as e:
         _API.close()
         sys.exit(f"ERROR: {e}")
     del api_key
     try:
-        version = _API.call("system.version")
-    except ApiError:
-        version = "unknown version"
-
-    print(f"=== local homes provisioner [{'DRY-RUN' if dry else 'APPLY'}] "
-          f"{host} ({version}, {_API.protocol} API) parent={parent} ===\n")
-
-    stats = {k: 0 for k in ("groups_created", "users_created", "users_missing",
-                            "memberships_added", "passwords_reset", "skipped",
-                            "folders_created", "acls_set", "quotas_set", "ok")}
-    cards = []
-    gcache = {}
-    orphans = []
-    failed = None
-    print(f"passphrases: {args.words} words from {len(gen.pool)} "
-          f"(~{gen.bits():.0f} bits each), separator '{args.sep}'\n")
-    try:
-        orphans = run(args, dry, parent, rows, csv_names, gen, cards, gcache, stats)
-    except ApiError as e:
-        failed = e
+        ok, _, _ = execute(args, dry, parent, rows, csv_names, gen, cards_out)
     finally:
         _API.close()
-        # Always emit cards for passphrases already set, even if a later step failed.
-        if cards:
-            write_cards_pdf(cards_out, cards, args.card_title, sample=dry)
-            label = "SAMPLE card(s) — passphrases NOT set" if dry else "credential card(s)"
-            print(f"!! {len(cards)} {label} written to {os.path.abspath(cards_out)} (0600).")
-            if not dry:
-                print("   Store in a password manager, hand out, then shred the PDF "
-                      "and any printouts.\n")
-            else:
-                print()
-
-    if failed:
-        sys.exit(f"ERROR: {failed}\n(stopped; changes made before this point were kept)")
-
-    print("=== summary ===")
-    for k, v in stats.items():
-        print(f"  {k.replace('_', ' '):<18} {v}")
-    print(f"  {'orphans':<18} {len(orphans)}")
+    if not ok:
+        sys.exit(1)
     if dry:
         print("\n(DRY-RUN — nothing was changed. Re-run with --apply to execute.)")
+
+
+# --------------------------------------------------------------------------- #
+# Wizard — asks for each setting, runs a dry run, then applies on confirmation
+# --------------------------------------------------------------------------- #
+WIZARD_STEPS = 8
+CONFIG_KEYS = ("host", "fingerprint", "api_key_file", "parent", "csv", "homes_group",
+               "admin_group", "manage_parent", "create_users", "share_path", "words",
+               "wordlist")
+EXAMPLE_CSV = ("username,full_name,groups,quota\n"
+               "alice,Alice Smith,staff;finance,500G\n"
+               "bob,Bob Jones,staff,\n")
+
+
+class Cancelled(Exception):
+    pass
+
+
+def config_path(args):
+    if args.config:
+        return os.path.expanduser(args.config)
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config")
+    return os.path.join(base, "provision_local_homes.json")
+
+
+def load_config(path):
+    try:
+        with open(path) as f:
+            cfg = json.load(f)
+        return {k: v for k, v in cfg.items() if k in CONFIG_KEYS} if isinstance(cfg, dict) else {}
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError) as e:
+        print(f"  (ignoring unreadable settings file {path}: {e})")
+        return {}
+
+
+def save_config(path, cfg):
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump({k: cfg.get(k) for k in CONFIG_KEYS if cfg.get(k) not in (None, "")},
+                  f, indent=2)
+        f.write("\n")
+    os.chmod(path, 0o600)
+
+
+def _input(prompt):
+    try:
+        return input(prompt)
+    except EOFError:
+        raise Cancelled from None
+
+
+def ask(prompt, default=None, validate=None, allow_blank=False):
+    """Prompt until a valid answer. Enter accepts the [default]; 'none' clears it."""
+    while True:
+        shown = f" [{default}]" if default not in (None, "") else ""
+        raw = _input(f"  {prompt}{shown}: ").strip()
+        if allow_blank and raw.lower() == "none":
+            return ""
+        val = raw or (default or "")
+        if not val:
+            if allow_blank:
+                return ""
+            print("    (an answer is needed here)")
+            continue
+        err = validate(val) if validate else None
+        if err:
+            print(f"    {err}")
+            continue
+        return val
+
+
+def ask_yes(prompt, default=False):
+    """default=None means there is no default: Enter alone is asked again."""
+    hint = "y/n" if default is None else ("Y/n" if default else "y/N")
+    while True:
+        raw = _input(f"  {prompt} [{hint}]: ").strip().lower()
+        if not raw and default is not None:
+            return default
+        if raw in ("y", "yes"):
+            return True
+        if raw in ("n", "no"):
+            return False
+        print("    please answer y or n")
+
+
+def step(n, title):
+    print(f"\n== Step {n} of {WIZARD_STEPS}: {title} " + "=" * max(0, 50 - len(title)))
+
+
+def fmt_size(n):
+    if n is None:
+        return "-"
+    for unit, size in (("PiB", 1024**5), ("TiB", 1024**4), ("GiB", 1024**3),
+                       ("MiB", 1024**2), ("KiB", 1024)):
+        if n >= size:
+            v = n / size
+            return f"{v:.0f} {unit}" if v == int(v) else f"{v:.1f} {unit}"
+    return f"{n} B"
+
+
+def dataset_acltype(ds):
+    raw = ds.get("acltype")
+    if isinstance(raw, dict):              # {"value": "NFSV4", ...} on most releases
+        raw = raw.get("value")
+    return str(raw).upper()
+
+
+def equivalent_command(a, apply):
+    import shlex
+    here = os.path.dirname(os.path.abspath(__file__))
+    prog = "./provision_local_homes.py" if os.path.abspath(os.getcwd()) == here \
+        else os.path.abspath(__file__)
+    parts = [prog, a.csv, "--host", a.host, "--parent", a.parent]
+    if a.fingerprint:
+        parts += ["--fingerprint", _fmt_fp(_norm_fp(a.fingerprint))]
+    if a.ca_cert:
+        parts += ["--ca-cert", a.ca_cert]
+    if a.api_key_file:
+        parts += ["--api-key-file", a.api_key_file]
+    if a.homes_group != "nas-homes":
+        parts += ["--homes-group", a.homes_group]
+    if a.admin_group:
+        parts += ["--admin-group", a.admin_group]
+    for flag, on in (("--manage-parent", a.manage_parent), ("--create-users", a.create_users),
+                     ("--reset-passwords", a.reset_passwords)):
+        if on:
+            parts.append(flag)
+    if a.only:
+        parts += ["--only", a.only]
+    if needs_passphrases(a):
+        if a.words != 3:
+            parts += ["--words", str(a.words)]
+        if a.share_path:
+            parts += ["--share-path", a.share_path]
+        if os.path.abspath(a.wordlist) != os.path.join(here, "eff_large_wordlist.txt"):
+            parts += ["--wordlist", a.wordlist]
+    if apply:
+        parts.append("--apply")
+    return " ".join(shlex.quote(p) for p in parts)
+
+
+def wizard_connect(a, cli_fp, cfg):
+    """Connect, settle certificate trust with the user, return (api, host, pinned_fp)."""
+    while True:
+        a.host = ask("NAS hostname or IP (add :port if not 443)", a.host)
+        host, port = split_host(a.host)
+        # A saved fingerprint only vouches for the host it was saved with.
+        saved_fp = cli_fp or (cfg.get("fingerprint") if a.host == cfg.get("host") else None)
+        try:
+            api = TrueNAS(host, port, tls_context(a.ca_cert, False), None,
+                          a.protocol, a.timeout)
+            print("    [ok] the NAS certificate is trusted by this computer.")
+            return api, host, None
+        except ssl.SSLCertVerificationError:
+            pass                                    # self-signed: fall through to pinning
+        except (OSError, ApiError) as e:
+            print(f"    cannot connect to {host}:{port}: {e}")
+            print("    Check the name/IP, that the NAS is on, and that its web UI loads "
+                  "over https from this computer.")
+            continue
+        try:
+            api = TrueNAS(host, port, tls_context(None, True), None, a.protocol, a.timeout)
+        except (OSError, ApiError) as e:
+            print(f"    cannot connect to {host}:{port}: {e}")
+            continue
+        fp = api.ws.peer_fingerprint()
+        print("    The NAS uses a self-signed certificate (the TrueNAS default), so this")
+        print("    computer can't vouch for it. Its SHA-256 fingerprint is:\n")
+        print(f"      {_fmt_fp(fp)}\n")
+        if saved_fp and _norm_fp(saved_fp) == fp:
+            print("    [ok] matches the fingerprint you saved last time.")
+            return api, host, fp
+        if saved_fp:
+            print("    !! WARNING: this is NOT the fingerprint you saved last time:")
+            print(f"      {_fmt_fp(_norm_fp(saved_fp))}")
+            print("    That is expected only if the NAS certificate was replaced or renewed.")
+            print("    Otherwise something may be intercepting the connection.")
+            question = "Trust the NEW certificate anyway?"
+        else:
+            print("    Before trusting it, check it on the NAS itself. In the TrueNAS web UI open")
+            print("    System > Shell (or SSH in) and run:\n")
+            print("      midclt call system.general.config | python3 -c 'import json,sys; "
+                  "print(json.load(sys.stdin)[\"ui_certificate\"][\"certificate\"])' \\")
+            print("        | openssl x509 -noout -fingerprint -sha256\n")
+            question = "Does the fingerprint the NAS shows match the one above?"
+        if ask_yes(question, False):
+            return api, host, fp
+        api.close()
+        raise Cancelled("certificate not trusted; nothing was sent to the NAS")
+
+
+def wizard_login(api, a, host):
+    """Try $TRUENAS_API_KEY / saved key file, else ask. Loops until login works."""
+    tried_env = tried_file = False
+    while True:
+        key, source = None, None
+        env_key = os.environ.get("TRUENAS_API_KEY", "").strip()
+        if env_key and not tried_env:
+            tried_env, key, source = True, env_key, "$TRUENAS_API_KEY"
+        elif a.api_key_file and not tried_file:
+            tried_file = True
+            try:
+                with open(os.path.expanduser(a.api_key_file)) as f:
+                    key, source = f.read().strip(), a.api_key_file
+            except OSError as e:
+                print(f"    cannot read {a.api_key_file}: {e}")
+                a.api_key_file = None
+        if key is None:
+            print("  Create a key in the TrueNAS web UI: user icon (top right) > API Keys > Add.")
+            print("  Pick an admin user. The key is shown only once, so copy it right away.")
+            path = ask("Path to a file holding the key (Enter to paste it instead)",
+                       allow_blank=True)
+            if path:
+                try:
+                    with open(os.path.expanduser(path)) as f:
+                        key, source = f.read().strip(), path
+                    a.api_key_file = path
+                except OSError as e:
+                    print(f"    cannot read {path}: {e}")
+                    continue
+            else:
+                key = getpass.getpass("  API key (typing is hidden): ").strip()
+                source = "the key you typed"
+        if not key:
+            print("    (no key given)")
+            continue
+        try:
+            start_session(api, key, a.api_user, host)
+            print(f"    [ok] logged in with {source} - {api.label}")
+            return
+        except ApiError as e:
+            print(f"    login with {source} failed: {e}")
+
+
+def wizard_pick_dataset(a):
+    datasets = call("pool.dataset.query", [], label="list datasets") or []
+    usable, hidden = [], 0
+    for ds in datasets:
+        mp, dsid = ds.get("mountpoint") or "", ds.get("id", "")
+        if not mp.startswith("/mnt/") or any(p.startswith(".") or p == "ix-applications"
+                                              for p in dsid.split("/")):
+            continue
+        if "NFS" in dataset_acltype(ds):
+            usable.append(ds)
+        else:
+            hidden += 1
+    usable.sort(key=lambda d: d["mountpoint"])
+    print("  The folders are created inside one dataset, which must use NFSv4 ACLs.")
+    if not usable:
+        raise Cancelled("no NFSv4 dataset found. In TrueNAS create one under Datasets > "
+                        "Add Dataset with the SMB preset (or ACL Type: NFSv4), then rerun")
+    for i, ds in enumerate(usable, 1):
+        print(f"    {i}) {ds['mountpoint']}")
+    if hidden:
+        print(f"    ({hidden} other dataset(s) hidden because they don't use NFSv4 ACLs)")
+    paths = [d["mountpoint"] for d in usable]
+    default = str(paths.index(a.parent) + 1) if a.parent in paths else ("1" if len(paths) == 1 else None)
+
+    def valid(v):
+        if v.isdigit():
+            return None if 1 <= int(v) <= len(paths) else f"pick 1-{len(paths)}"
+        return None if v.rstrip("/") in paths else "pick a number from the list"
+    choice = ask("Dataset number", default, valid)
+    a.parent = paths[int(choice) - 1] if choice.isdigit() else choice.rstrip("/")
+
+
+def wizard_load_csv(a):
+    while True:
+        a.csv = ask("Path to your users CSV", a.csv or "users.csv")
+        path = os.path.expanduser(a.csv)
+        if not os.path.exists(path):
+            print(f"    {path} doesn't exist. It's a spreadsheet saved as CSV, like:\n")
+            for line in EXAMPLE_CSV.splitlines():
+                print(f"      {line}")
+            print("\n    groups are separated by ';'; quota is optional (500G, 1T).")
+            if ask_yes(f"Create a starter {a.csv} you can edit?", True):
+                fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                with os.fdopen(fd, "w") as f:
+                    f.write(EXAMPLE_CSV)
+                print(f"    Created {os.path.abspath(path)}. Edit it (any text editor or "
+                      "spreadsheet app), save, then press Enter.")
+                _input("  [Enter when done] ")
+            continue
+        try:
+            return load_csv(path)
+        except SystemExit as e:
+            print(f"    {e}")
+            print("    Fix the file, then press Enter to try again.")
+            _input("  [Enter when done] ")
+
+
+def wizard_preview(rows, parent):
+    existing = {u["username"]: u for u in call("user.query", [], label="list users") or []}
+    entries = list_entries(parent)
+    print(f"\n  {'USERNAME':<14}{'FULL NAME':<20}{'GROUPS':<20}{'QUOTA':<9}{'ON NAS':<9}FOLDER")
+    new = present = 0
+    for r in rows:
+        u = existing.get(r["username"])
+        if u is None:
+            status, new = "new", new + 1
+        elif u.get("builtin") or u.get("local") is False:
+            status = "skip*"
+        else:
+            status, present = "exists", present + 1
+        kind = entries.get(r["username"])
+        folder = "exists" if kind == "DIRECTORY" else ("missing" if kind is None else kind.lower())
+        print(f"  {r['username'][:13]:<14}{r['full_name'][:19]:<20}"
+              f"{', '.join(r['groups'])[:19] or '-':<20}{fmt_size(r['quota']):<9}"
+              f"{status:<9}{folder}")
+    if any(existing.get(r["username"]) and (existing[r["username"]].get("builtin")
+           or existing[r["username"]].get("local") is False) for r in rows):
+        print("  * system or directory-service accounts are never changed")
+    print(f"\n  {len(rows)} user(s) in the CSV: {new} new, {present} already on the NAS.")
+    return new, present
+
+
+def wizard_options(a, cfg, new, present):
+    if new:
+        a.create_users = ask_yes(f"Create the {new} new user(s) with random passphrases?",
+                                 cfg.get("create_users", True))
+        if not a.create_users:
+            print("    OK - they'll be listed as MISSING and get no folder.")
+    else:
+        a.create_users = False
+    if present:
+        a.reset_passwords = ask_yes(
+            "Give users who already exist a NEW passphrase too? (they'll need the new card)",
+            False)
+        if a.reset_passwords:
+            a.only = ask("Only one user? Type the username, or Enter for everyone in the CSV",
+                         allow_blank=True) or None
+
+    def group_ok(v):
+        return None if GROUPNAME_RE.fullmatch(v) else "letters, digits, '.', '_' or '-' only"
+    print("\n  Every user joins one shared group, used to let them reach their own folder.")
+    a.homes_group = ask("Shared group name", cfg.get("homes_group") or "nas-homes", group_ok)
+    print("\n  Optionally, an admin group can open every user's folder (for support and")
+    print("  recovery). Leave blank for no admin access; type 'none' to clear a saved one.")
+    a.admin_group = ask("Admin group name", cfg.get("admin_group"),
+                        lambda v: group_ok(v), allow_blank=True) or None
+    print("\n  Recommended: lock down the top folder so users can open their own folder")
+    print("  but can't see the list of other users' folders.")
+    a.manage_parent = ask_yes("Set that permission on the top folder?",
+                              cfg.get("manage_parent", True))
+
+    if needs_passphrases(a):
+        def words_ok(v):
+            return None if v.isdigit() and 2 <= int(v) <= 8 else "a number from 2 to 8"
+        print("\n  Passphrases look like 'bedal-bakar-bacun'. 3 words is fine for a home or")
+        print("  small office NAS; 4 is stronger and still easy to type.")
+        a.words = int(ask("Words per passphrase", str(cfg.get("words") or 3), words_ok))
+        print("\n  The cards can show how to connect, e.g. \\\\nas\\homes\\{user}")
+        print("  ({user} is replaced with each username).")
+        a.share_path = ask("Connection path for the cards (Enter to leave off)",
+                           cfg.get("share_path"), allow_blank=True) or None
+        while not os.path.exists(a.wordlist):
+            print(f"\n  The passphrase wordlist isn't at {a.wordlist}. Download it with:")
+            print("    wget https://www.eff.org/files/2016/07/18/eff_large_wordlist.txt")
+            a.wordlist = os.path.expanduser(ask("Path to eff_large_wordlist.txt", a.wordlist))
+
+
+def wizard(args):
+    global _API, SHOW_DRY_DETAIL
+    SHOW_DRY_DETAIL = False
+    a = argparse.Namespace(**vars(args))
+    cfg_file = config_path(args)
+    cfg = load_config(cfg_file)
+    # Command-line values win over saved ones; saved ones fill the gaps.
+    for k in ("host", "api_key_file", "parent", "csv", "share_path"):
+        if not getattr(a, k, None) and cfg.get(k):
+            setattr(a, k, cfg[k])
+    if cfg.get("wordlist") and a.wordlist.endswith("eff_large_wordlist.txt") \
+            and not os.path.exists(a.wordlist):
+        a.wordlist = cfg["wordlist"]
+    if a.reset_passwords is None:
+        a.reset_passwords = False
+
+    print("\nTrueNAS private home folders - guided setup")
+    print("Nothing is changed on the NAS until you confirm at the end.")
+    print("Press Enter to accept the [default] shown. Ctrl+C cancels at any time.")
+    if cfg:
+        print(f"(Defaults come from your saved settings in {cfg_file})")
+
+    applied = False
+    try:
+        step(1, "Connect to the NAS")
+        _API, host, pinned_fp = wizard_connect(a, args.fingerprint, cfg)
+        a.fingerprint = _fmt_fp(pinned_fp) if pinned_fp else None
+        if pinned_fp:
+            _API.fingerprint = pinned_fp       # reconnects must present the same certificate
+        try:
+            step(2, "API key")
+            wizard_login(_API, a, host)
+
+            step(3, "Choose the dataset")
+            wizard_pick_dataset(a)
+
+            step(4, "Users")
+            rows = wizard_load_csv(a)
+            csv_names = {r["username"] for r in rows}
+            _API.ensure_alive()
+            new, present = wizard_preview(rows, a.parent)
+
+            step(5, "Options")
+            wizard_options(a, cfg, new, present)
+            if a.only:
+                rows = [r for r in rows if r["username"] == a.only]
+                if not rows:
+                    raise Cancelled(f"'{a.only}' is not in the CSV")
+            gen = PassphraseGen(a.wordlist, a.words, a.sep) if needs_passphrases(a) else None
+
+            step(6, "Review (dry run - nothing is changed)")
+            print("  This is what would happen. Lines starting with -> are changes; nothing")
+            print("  else is touched. (Run the command shown at the end without --apply")
+            print("  to see the exact API calls.)\n")
+            _API.ensure_alive()
+            ok, stats, _ = execute(a, True, a.parent, rows, csv_names, gen,
+                                   None, sample_cards=False)
+            if not ok:
+                raise Cancelled("the dry run hit an error (shown above); nothing was changed")
+            changes = sum(stats[k] for k in CHANGE_KEYS)
+
+            step(7, "Apply")
+            if not changes:
+                print("  Everything is already in place - nothing to apply.")
+                if stats["users_missing"]:
+                    print(f"  ({stats['users_missing']} user(s) are missing because you chose "
+                          "not to create them.)")
+            elif ask_yes("Apply the changes listed above to the NAS now? "
+                         "(type y to apply, n to stop)", None):
+                applied = True
+                cards_out = a.cards_out or default_cards_out(False)
+                _API.ensure_alive()
+                ok, stats, _ = execute(a, False, a.parent, rows, csv_names, gen, cards_out)
+                print()
+                if ok:
+                    made = []
+                    for k, label in (("users_created", "user(s) created"),
+                                     ("passwords_reset", "passphrase(s) reset"),
+                                     ("folders_created", "folder(s) created"),
+                                     ("acls_set", "permission(s) set"),
+                                     ("quotas_set", "quota(s) set")):
+                        if stats[k]:
+                            made.append(f"{stats[k]} {label}")
+                    print("  DONE: " + (", ".join(made) or "changes applied") + ".")
+                    if os.path.exists(cards_out):
+                        print(f"  Credential cards: {os.path.abspath(cards_out)}")
+                else:
+                    print("  Stopped part-way. Fix the problem above and run again; "
+                          "anything already done is kept and skipped next time.")
+                    if os.path.exists(cards_out):
+                        print(f"  Cards for passphrases already set: {os.path.abspath(cards_out)}")
+            else:
+                print("  NOT APPLIED - nothing was changed: no users, folders or cards "
+                      "were created.")
+        finally:
+            _API.close()
+
+        step(8, "Save settings")
+        if ask_yes(f"Save these answers as defaults for next time? "
+                   f"(the API key itself is never saved)", True):
+            save_config(cfg_file, {
+                "host": a.host, "fingerprint": a.fingerprint, "api_key_file": a.api_key_file,
+                "parent": a.parent, "csv": a.csv, "homes_group": a.homes_group,
+                "admin_group": a.admin_group, "manage_parent": a.manage_parent,
+                "create_users": a.create_users, "share_path": a.share_path,
+                "words": a.words, "wordlist": os.path.abspath(a.wordlist)})
+            print(f"    Saved to {cfg_file}")
+        print("\n  Next time, run with --wizard again and press Enter through the saved")
+        print("  answers, or skip the questions with:\n")
+        print(f"    {equivalent_command(a, apply=True)}\n")
+        if not (a.api_key_file or os.environ.get("TRUENAS_API_KEY")):
+            print("  (that command will ask for the API key; set TRUENAS_API_KEY or use "
+                  "--api-key-file to avoid typing it)")
+        return 0 if ok or not applied else 1
+    except (Cancelled, KeyboardInterrupt) as e:
+        reason = f": {e}" if isinstance(e, Cancelled) and str(e) else ""
+        print(f"\n\nCancelled{reason}.")
+        if applied:
+            print("Changes made before cancelling were kept; run again to finish.")
+        else:
+            print("Nothing was changed on the NAS.")
+        return 1
 
 
 def run(args, dry, parent, rows, csv_names, gen, cards, gcache, stats):
@@ -928,10 +1503,7 @@ def run(args, dry, parent, rows, csv_names, gen, cards, gcache, stats):
     if not ds:
         raise ApiError(f"{parent} is not the mountpoint of a dataset on this NAS")
     ds = ds[0]
-    raw_acltype = ds.get("acltype")
-    if isinstance(raw_acltype, dict):          # {"value": "NFSV4", ...} on most releases
-        raw_acltype = raw_acltype.get("value")
-    acltype = str(raw_acltype).upper()
+    acltype = dataset_acltype(ds)
     if "NFS" not in acltype:
         raise ApiError(f"dataset {ds['id']} acltype is {acltype}; set it to NFSv4 first")
     entries = list_entries(parent)
@@ -995,7 +1567,7 @@ def run(args, dry, parent, rows, csv_names, gen, cards, gcache, stats):
             print(f"    -> CREATE folder {path}")
             stats["folders_created"] += 1
             if dry:
-                print(f"      [DRY-RUN] filesystem.mkdir {path}")
+                dry_detail(f"      [DRY-RUN] filesystem.mkdir {path}")
             else:
                 make_dir(path)
 
