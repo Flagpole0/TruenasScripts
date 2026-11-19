@@ -1,1135 +1,1391 @@
 #!/usr/bin/env python3
 """
-TrueNAS Configuration Archiver + Infrastructure Runbook
-=========================================================
-Pulls configuration AND health/status data from the TrueNAS REST API to produce
-a comprehensive, human-readable Markdown runbook plus an encrypted config backup.
+truenas_config_dr.py — build disaster-recovery documentation from a TrueNAS
+configuration export, entirely offline.
 
-Part 1: Configuration Archive  — what is configured
-Part 2: Deep Dive Appendix     — what shape it's in right now
+Why the config file instead of the API
+--------------------------------------
+* No API key, no network, no live session against the NAS.
+* Runs on an air-gapped workstation: the NAS never knows it happened.
+* The export is the exact artifact you restore from, so the document
+  describes precisely what a restore will bring back.
 
-Redaction can be toggled at runtime or via TRUENAS_REDACT=false env var.
-Unredacted output includes ALL secrets in plain text for disaster recovery.
+Input
+-----
+Download from the TrueNAS UI: System > General Settings > Manage Configuration
+> Download File, and tick "Export Password Secret Seed". That gives a .tar
+holding freenas-v1.db (SQLite) and pwenc_secret (the key TrueNAS uses to
+encrypt stored passwords). A bare .db works too, but encrypted fields stay
+opaque without the seed.
 
-Requirements:  pip3 install requests   (or: sudo apt install python3-requests)
-Usage:         python3 truenas_runbook.py
+Security model
+--------------
+* The database is loaded straight into memory; it is never extracted to disk
+  (Python 3.11+; on older Pythons a 0600 temp copy in /dev/shm is used and
+  removed immediately).
+* The database is opened read-only (query_only).
+* Default output is REDACTED: secrets show as [set]/[empty]. Anything TrueNAS
+  itself stores encrypted is redacted unless its name is on a short
+  known-harmless list (host, port, username, region, ...).
+* Unredacted output needs an explicit confirmation (type the hostname) and
+  gets a warning banner plus an _UNREDACTED filename tag. Encrypted fields
+  can only be shown if the export includes the secret seed.
+* Output files are created 0600 via a private temp file and atomic rename.
+  Optionally they are piped straight into GPG so plaintext never touches disk.
+* Secrets are never printed to the terminal.
+
+Known limit of redaction: free-text fields (cron commands, init scripts, SMB
+auxiliary parameters, tunables) are shown as-is. If you embed a token or
+password in a cron command line, it will appear in the redacted document.
+
+Requirements: Python 3.8+. Optional: python3-cryptography (decrypting secret
+fields, certificate expiry dates), gpg (encrypted output).
+On Linux Mint:  sudo apt install python3-cryptography
+
+Usage
+-----
+  python3 truenas_config_dr.py                       # interactive wizard
+  python3 truenas_config_dr.py -c backup.tar --batch # redacted md+html, defaults
+  python3 truenas_config_dr.py -c backup.tar --batch --unredacted \
+          --confirm-host faultline --gpg-recipient you@example.com
 """
 
-import requests, json, datetime, os, sys, time, getpass
-from urllib.parse import urljoin
-from pathlib import Path
-from collections import defaultdict
+from __future__ import annotations
 
-import urllib3
-urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+import argparse
+import base64
+import datetime as dt
+import hashlib
+import html
+import io
+import json
+import os
+import re
+import shutil
+import sqlite3
+import subprocess
+import sys
+import tarfile
+import tempfile
+
+try:
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+    from cryptography import x509
+    HAVE_CRYPTO = True
+except (KeyboardInterrupt, SystemExit):
+    raise
+except BaseException:  # missing or broken install (a mismatched build raises a non-Exception
+    HAVE_CRYPTO = False  # panic): decryption and certificate parsing become unavailable
+
+VERSION = "1.1"
+MAX_EXPORT_BYTES = 512 * 1024 * 1024   # a config export is a few MB at most
+MAX_MEMBER_BYTES = 256 * 1024 * 1024
+SQLITE_MAGIC = b"SQLite format 3\x00"
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  CONFIGURATION — edit these or use environment variables
-# ═══════════════════════════════════════════════════════════════════════════════
-TRUENAS_HOST    = os.environ.get("TRUENAS_HOST", "")
-TRUENAS_APIKEY  = os.environ.get("TRUENAS_APIKEY", "")
-VERIFY_SSL      = os.environ.get("TRUENAS_VERIFY_SSL", "false").lower() == "true"
-OUTPUT_DIR      = os.environ.get("TRUENAS_OUTPUT_DIR", ".")
-DOWNLOAD_BACKUP = True
-DEEP_DIVE       = True    # set False to skip the appendix and just do config
-REDACT_ENABLED  = True    # toggled at runtime or via TRUENAS_REDACT=false
+class ConfigError(Exception):
+    pass
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  PART 1 — CONFIGURATION SECTIONS
-#  (label, endpoint, key_filter, display_mode)
-# ═══════════════════════════════════════════════════════════════════════════════
+# ---------------------------------------------------------------------------
+# Loading the export
+# ---------------------------------------------------------------------------
+
+class LoadedConfig:
+    def __init__(self, path, conn, secret, members, sha256, size):
+        self.path = path
+        self.conn = conn
+        self.secret = secret
+        self.members = members      # [(name, size)] inside the tar
+        self.sha256 = sha256
+        self.size = size
+
+
+def qi(name: str) -> str:
+    """Quote an SQL identifier taken from the (untrusted) database itself."""
+    return '"' + str(name).replace('"', '""') + '"'
+
+
+def clean(text, keep_newlines=False) -> str:
+    """Strip control characters from database text before it reaches a terminal or filename."""
+    ok = "\n\t" if keep_newlines else ""
+    return "".join(c for c in str(text) if c.isprintable() or c in ok)
+
+
+def _db_to_memory(db_bytes: bytes) -> sqlite3.Connection:
+    if db_bytes[18:20] == b"\x02\x02":
+        # WAL-mode header: an in-memory image has no -wal file, so SQLite refuses to
+        # open it. Flag the copy as rollback-journal mode (documented SQLite technique).
+        db_bytes = db_bytes[:18] + b"\x01\x01" + db_bytes[20:]
+    conn = sqlite3.connect(":memory:")
+    if hasattr(conn, "deserialize"):
+        conn.deserialize(db_bytes)
+    else:  # Python < 3.11: short-lived private copy in RAM-backed storage
+        tmpdir = "/dev/shm" if os.path.isdir("/dev/shm") else None
+        fd, tmp = tempfile.mkstemp(prefix=".tncfg-", dir=tmpdir)
+        try:
+            os.fchmod(fd, 0o600)
+            os.write(fd, db_bytes)
+            os.close(fd)
+            src = sqlite3.connect(tmp)
+            src.backup(conn)
+            src.close()
+        finally:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+    conn.execute("PRAGMA query_only = ON")
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def load_config(path: str, seed_path: str | None = None) -> LoadedConfig:
+    if os.path.getsize(path) > MAX_EXPORT_BYTES:
+        raise ConfigError(f"{os.path.basename(path)} is larger than "
+                          f"{MAX_EXPORT_BYTES // 2**20} MB — not a TrueNAS config export.")
+    with open(path, "rb") as fh:
+        data = fh.read()
+    sha = hashlib.sha256(data).hexdigest()
+    db_bytes, secret, members = None, None, []
+
+    if data[:16] == SQLITE_MAGIC:
+        db_bytes = data
+        members.append((os.path.basename(path), len(data)))
+    else:
+        try:
+            tf = tarfile.open(fileobj=io.BytesIO(data), mode="r:*")
+            for m in tf.getmembers():
+                if not m.isfile():
+                    continue
+                if m.size > MAX_MEMBER_BYTES:
+                    members.append((m.name, m.size))
+                    continue
+                blob = tf.extractfile(m).read()
+                members.append((m.name, len(blob)))
+                base = os.path.basename(m.name)
+                if blob[:16] == SQLITE_MAGIC and db_bytes is None:
+                    db_bytes = blob
+                elif base == "pwenc_secret":
+                    secret = blob
+        except (tarfile.TarError, EOFError, OSError, ValueError) as e:
+            detail = "" if isinstance(e, tarfile.ReadError) else f" ({e or type(e).__name__})"
+            raise ConfigError("Not a readable TrueNAS config export — expected the .tar or .db "
+                              f"file downloaded from TrueNAS{detail}.")
+        if db_bytes is None:
+            raise ConfigError("Archive has no SQLite database (freenas-v1.db).")
+
+    if seed_path:
+        with open(seed_path, "rb") as fh:
+            secret = fh.read()
+
+    try:
+        conn = _db_to_memory(db_bytes)
+        conn.execute("SELECT count(*) FROM sqlite_master").fetchone()
+    except sqlite3.Error as e:
+        raise ConfigError(f"Database unreadable: {e}")
+    return LoadedConfig(path, conn, secret, members, sha, len(data))
+
+
+# ---------------------------------------------------------------------------
+# TrueNAS password encryption (middlewared pwenc): base64(nonce8 || AES-CTR)
+# with '{' padding to 32-byte blocks, key = pwenc_secret.
+# ---------------------------------------------------------------------------
+
+def _printable(s: str) -> bool:
+    return all(c.isprintable() or c in "\n\r\t" for c in s)
+
+
+class Pwenc:
+    def __init__(self, secret: bytes | None):
+        self.key = secret
+        self.available = bool(HAVE_CRYPTO and secret and len(secret) in (16, 24, 32))
+
+    @staticmethod
+    def looks_encrypted(value) -> bool:
+        """True if value has the exact shape pwenc produces: base64 of 8 + 32*n bytes."""
+        if not isinstance(value, str) or len(value) < 56:
+            return False
+        try:
+            raw = base64.b64decode(value, validate=True)
+        except Exception:
+            return False
+        return len(raw) >= 40 and (len(raw) - 8) % 32 == 0
+
+    def decrypt(self, value):
+        if not self.available or not isinstance(value, str) or len(value) < 16:
+            return None
+        try:
+            raw = base64.b64decode(value, validate=True)
+        except Exception:
+            return None
+        nonce, ct = raw[:8], raw[8:]
+        if len(raw) < 9 or len(ct) % 16:
+            return None
+        for start in (1, 0):  # pycryptodome Counter default starts at 1
+            d = Cipher(algorithms.AES(self.key),
+                       modes.CTR(nonce + start.to_bytes(8, "big"))).decryptor()
+            pt = (d.update(ct) + d.finalize()).rstrip(b"{")
+            try:
+                s = pt.decode("utf-8")
+            except UnicodeDecodeError:
+                continue
+            if _printable(s):
+                return s
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Secret classification
+# ---------------------------------------------------------------------------
+
+SECRET_RE = re.compile(
+    r"(pass|pwd|_pw$|bindpw|secret|privatekey|private_key|token|psk|key$|"
+    r"oauth|keytab|community|otp|seed|salt|license)", re.I)
+PUBLIC_RE = re.compile(
+    r"(_pub$|public|pubkey|remote_host_key|keytype|key_type|_id$|uid$|"
+    r"fingerprint|^id$|enabled?$|passwordauth|password_disabled|kdf)", re.I)
+HASH_RE = re.compile(r"hash", re.I)
+B64_RE = re.compile(r"[A-Za-z0-9+/]{24,}={0,2}")
+NESTED_SECRET_RE = re.compile(SECRET_RE.pattern + r"|url|webhook|key|account|"
+                              r"client_id|tenant|hostkey", re.I)
+NESTED_PUBLIC_RE = re.compile(r"(public_key|remote_host_key|^username$|^user$|^host$|"
+                              r"^hostname$|^port$|endpoint|region|bucket|^type$|"
+                              r"^provider$|timeout|^folder$|^cipher$)", re.I)
+# Columns whose name looks secret but is not.
+PUBLIC_COLS = {("system_keyvalue", "key")}
+
+
+class Secret:
+    """A sensitive value. Rendering depends on the output mode."""
+    def __init__(self, raw, plain=None, kind="secret", note=None):
+        self.raw, self.plain, self.kind, self.note = raw, plain, kind, note
+
+    def present(self):
+        return self.raw not in (None, "", b"")
+
+    def show(self, unredacted: bool) -> str:
+        if not self.present():
+            return "[empty]"
+        if self.kind == "hash":
+            if self.raw in ("*", "!", "x"):
+                return "[no password set]"
+            return "[hash stored — restored with config]"
+        if not unredacted:
+            return "[set]"
+        if self.plain is not None:
+            return self.plain
+        return f"{self.raw}  [{self.note or 'not decrypted'}]"
+
+
+def _maybe_b64_text(s: str):
+    """SSH host keys etc. are stored base64; show them as PEM if they are."""
+    try:
+        t = base64.b64decode(s, validate=True).decode("utf-8")
+        return t if t.startswith("-----BEGIN") or t.startswith("ssh-") else None
+    except Exception:
+        return None
+
+
+def redact_nested(obj, unredacted: bool, strict: bool = False, _force: bool = False):
+    """Redact secret leaves of a JSON structure.
+
+    strict  — the blob was stored encrypted by TrueNAS: every string is treated as
+              secret unless its key is on the known-harmless list (fail closed).
+    _force  — we are underneath a key that is itself secret: redact everything.
+    """
+    if unredacted:
+        return obj
+    if isinstance(obj, dict):
+        out = {}
+        for k, v in obj.items():
+            k = str(k)
+            public = bool(NESTED_PUBLIC_RE.search(k))
+            secret = _force or (bool(NESTED_SECRET_RE.search(k)) and not public)
+            if isinstance(v, (dict, list)):
+                out[k] = redact_nested(v, unredacted, strict, secret)
+            elif isinstance(v, bool) or v is None:
+                out[k] = v
+            elif secret or (strict and isinstance(v, str) and not public):
+                out[k] = "[set]" if v != "" else "[empty]"
+            else:
+                out[k] = v
+        return out
+    if isinstance(obj, list):
+        out = []
+        for v in obj:
+            if isinstance(v, (dict, list)):
+                out.append(redact_nested(v, unredacted, strict, _force))
+            elif isinstance(v, bool) or v is None:
+                out.append(v)
+            elif _force or (strict and isinstance(v, str)):
+                out.append("[set]" if v != "" else "[empty]")
+            else:
+                out.append(v)
+        return out
+    return obj
+
+
+def multiline_leaves(obj, path=""):
+    """(path, text) for every multi-line string in a JSON structure, e.g. private keys."""
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            yield from multiline_leaves(v, f"{path}.{k}" if path else str(k))
+    elif isinstance(obj, list):
+        for i, v in enumerate(obj):
+            yield from multiline_leaves(v, f"{path}[{i}]")
+    elif isinstance(obj, str) and "\n" in obj:
+        yield path, obj
+
+
+# ---------------------------------------------------------------------------
+# Database inspection and value formatting
+# ---------------------------------------------------------------------------
+
+SCHED_PARTS = ("minute", "hour", "daymonth", "month", "dayweek")
+
+
+class Ctx:
+    def __init__(self, cfg: LoadedConfig, unredacted: bool, full: bool,
+                 builtin_users: bool):
+        self.cfg, self.conn = cfg, cfg.conn
+        self.pw = Pwenc(cfg.secret)
+        self.unredacted, self.full, self.builtin_users = unredacted, full, builtin_users
+        self.tables = {r[0] for r in self.conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+        self._cols, self._fks, self._labels = {}, {}, {}
+        self.covered = set()
+        self.stats = {"secrets": 0, "decrypted": 0, "undecryptable": 0}
+
+    # --- schema helpers ---------------------------------------------------
+    def cols(self, table):
+        if table not in self._cols:
+            self._cols[table] = [(r["name"], (r["type"] or "").upper())
+                                 for r in self.conn.execute(f"PRAGMA table_info({qi(table)})")]
+        return self._cols[table]
+
+    def fks(self, table):
+        if table not in self._fks:
+            self._fks[table] = {r["from"]: (r["table"], r["to"]) for r in
+                                self.conn.execute(f"PRAGMA foreign_key_list({qi(table)})")}
+        return self._fks[table]
+
+    def rows(self, table, order=None):
+        if table not in self.tables:
+            return None
+        q = f"SELECT * FROM {qi(table)}"
+        names = [c for c, _ in self.cols(table)]
+        if order and order in names:
+            q += f" ORDER BY {qi(order)}"
+        elif "id" in names:
+            q += " ORDER BY id"
+        return [dict(r) for r in self.conn.execute(q)]
+
+    def label_col(self, table):
+        names = [c for c, _ in self.cols(table)]
+        for pref in ("name", "bsdusr_username", "bsdgrp_group", "vol_name",
+                     "cert_name", "int_interface", "repl_name", "description",
+                     "cifs_name", "iscsi_target_name", "iscsi_target_extent_name",
+                     "srv_service", "path"):
+            if pref in names:
+                return pref
+        for c in names:
+            if c.endswith("_name") or c.endswith("_description"):
+                return c
+        return None
+
+    def fk_label(self, table, to_col, key):
+        """Human label for a foreign key, e.g. 'alex (#2)'."""
+        if key is None:
+            return None
+        ck = (table, to_col)
+        if ck not in self._labels:
+            m = {}
+            try:
+                if table in self.tables:
+                    names = [c for c, _ in self.cols(table)]
+                    to = to_col or ("id" if "id" in names else None)
+                    lc = self.label_col(table)
+                    if lc and to in names:
+                        for r in self.conn.execute(f"SELECT {qi(to)}, {qi(lc)} FROM {qi(table)}"):
+                            m[r[0]] = r[1]
+            except sqlite3.Error:
+                m = {}
+            self._labels[ck] = m
+        lbl = self._labels[ck].get(key)
+        return f"{lbl} (#{key})" if lbl not in (None, "") else f"#{key}"
+
+    @staticmethod
+    def prefix(names):
+        cand = [n for n in names if n != "id"]
+        if len(cand) < 2:
+            return ""
+        p = os.path.commonprefix(cand)
+        return p[:p.rfind("_") + 1] if "_" in p else ""
+
+    # --- value processing ------------------------------------------------
+    def _why_unreadable(self):
+        if not self.cfg.secret:
+            return "encrypted — export has no secret seed"
+        if not HAVE_CRYPTO:
+            return "encrypted — python3-cryptography missing or not working"
+        if not self.pw.available:
+            return "encrypted — secret seed has an unexpected length"
+        return "encrypted — did NOT decrypt with this secret seed (seed from another system?)"
+
+    def value(self, table, col, ctype, v):
+        """Return a str or a Secret for one cell."""
+        if isinstance(v, (bytes, bytearray)):
+            v = v.decode("utf-8", "replace")
+        if v is None:
+            return ""
+        if ctype == "BOOLEAN" and isinstance(v, int):
+            return "yes" if v else "no"
+        if not isinstance(v, str):
+            return str(v)
+        public = bool(PUBLIC_RE.search(col)) or (table, col) in PUBLIC_COLS
+        if HASH_RE.search(col) and not public:
+            return Secret(v, kind="hash")
+        is_secret = bool(SECRET_RE.search(col)) and not public
+        if v == "":
+            return Secret(v) if is_secret else ""
+
+        # 1. Stored encrypted by TrueNAS and we can decrypt it.
+        plain = self.pw.decrypt(v)
+        if plain is not None:
+            self.stats["decrypted"] += 1
+            if not is_secret and looks_json(plain):
+                js = self._json(plain, strict=True)   # show structure, redact the leaves
+                if js is not None:
+                    return js
+            self.stats["secrets"] += 1               # anything else that was encrypted is a secret
+            return Secret(v, self._reveal(plain))
+
+        # 2. Base64-wrapped text (SSH host keys are stored this way).
+        text = _maybe_b64_text(v) if B64_RE.fullmatch(v) else None
+        if text is not None:
+            if is_secret:
+                self.stats["secrets"] += 1
+                return Secret(v, text)
+            return text.rstrip("\n")
+
+        # 3. Has the exact shape of TrueNAS ciphertext but could not be decrypted.
+        if Pwenc.looks_encrypted(v):
+            self.stats["undecryptable"] += 1
+            why = self._why_unreadable()
+            if is_secret:
+                self.stats["secrets"] += 1
+                return Secret(v, None, note=why)
+            return f"[{why}]"
+
+        # 4. Stored in the clear.
+        if is_secret:
+            self.stats["secrets"] += 1
+            return Secret(v, self._reveal(v))
+        if looks_json(v):
+            js = self._json(v)
+            if js is not None:
+                return js
+        return v
+
+    def _reveal(self, plain):
+        """Most usable plaintext form of a secret (only ever shown in unredacted mode)."""
+        text = _maybe_b64_text(plain) if B64_RE.fullmatch(plain) else None
+        if text is not None:
+            return text
+        if looks_json(plain):
+            js = self._json(plain)
+            if js:
+                return js
+        return plain
+
+    def _json(self, s, strict=False):
+        """Pretty JSON with secret leaves redacted; None if s is not JSON."""
+        try:
+            obj = json.loads(s)
+        except ValueError:
+            return None
+        if obj in ({}, [], None):
+            return ""
+        text = json.dumps(redact_nested(obj, self.unredacted, strict), indent=1,
+                          sort_keys=True, ensure_ascii=False)
+        if self.unredacted:
+            # JSON escapes newlines; repeat multi-line values (private keys) verbatim
+            # so they can be copied straight out of the document.
+            for path, leaf in multiline_leaves(obj):
+                text += f"\n\n--- {path} (verbatim) ---\n{leaf}"
+        return text
+
+    def process(self, table, raw_rows):
+        """raw rows -> (ordered labels, [{label: value}], {column: label})"""
+        cols = self.cols(table)
+        names = [c for c, _ in cols]
+        pre = self.prefix(names)
+        fks = self.fks(table)
+        # schedule groups: <p>minute, <p>hour, <p>daymonth, <p>month, <p>dayweek
+        sched = {}
+        for c in names:
+            for part in SCHED_PARTS:
+                if c == part or c.endswith("_" + part):
+                    sched.setdefault(c[: -len(part)], {})[part] = c
+        sched = {p: d for p, d in sched.items() if len(d) == 5}
+        sched_of = {c: p for p, d in sched.items() for c in d.values()}
+
+        def label(c):
+            s = c[len(pre):] if pre and c.startswith(pre) else c
+            if s.endswith("_id") and c in fks:
+                s = s[:-3]
+            return s.replace("_", " ").strip() or c
+
+        used = set()
+
+        def unique(lbl, fallback):
+            # two columns must never share a label, or one would silently hide the other
+            if lbl in used or (lbl == "id" and fallback != "id"):
+                lbl = fallback
+            n, base = 2, lbl
+            while lbl in used:
+                lbl, n = f"{base} ({n})", n + 1
+            used.add(lbl)
+            return lbl
+
+        out_cols, colmap, sched_lbl = [], {}, {}
+        for c, _ in cols:
+            if c in sched_of:
+                p = sched_of[c]
+                if p not in sched_lbl:
+                    core = (p[len(pre):] if pre and p.startswith(pre) else p).strip("_").replace("_", " ")
+                    lbl = core if core.endswith("schedule") else (core + " schedule").strip()
+                    sched_lbl[p] = unique(lbl, p.strip("_") + "_schedule")
+                    out_cols.append((sched_lbl[p], ("sched", p)))
+                colmap[c] = sched_lbl[p]
+                continue
+            colmap[c] = unique(label(c), c)
+            out_cols.append((colmap[c], ("col", c)))
+
+        types = dict(cols)
+        out = []
+        for r in raw_rows:
+            d = {}
+            for lbl, (kind, ref) in out_cols:
+                if kind == "sched":
+                    parts = [r.get(sched[ref][p]) for p in SCHED_PARTS]
+                    d[lbl] = ("" if all(x is None for x in parts) else
+                              " ".join("*" if x is None else str(x) for x in parts)
+                              + "  (m h dom mon dow)")
+                elif ref in fks and r.get(ref) is not None:
+                    d[lbl] = self.fk_label(fks[ref][0], fks[ref][1], r[ref])
+                else:
+                    d[lbl] = self.value(table, ref, types.get(ref, ""), r.get(ref))
+            d["__raw__"] = r
+            out.append(d)
+        return [l for l, _ in out_cols], out, colmap
+
+
+def looks_json(v):
+    return isinstance(v, str) and len(v) >= 2 and v[0] in "{[" and v[-1] in "}]"
+
+
+# ---------------------------------------------------------------------------
+# Document model -> Markdown / HTML
+# ---------------------------------------------------------------------------
+
+class Doc:
+    def __init__(self):
+        self.blocks = []
+
+    def h1(self, t): self.blocks.append(("h1", t))
+    def h2(self, t): self.blocks.append(("h2", t))
+    def h3(self, t): self.blocks.append(("h3", t))
+    def p(self, t): self.blocks.append(("p", t))
+    def warn(self, t): self.blocks.append(("warn", t))
+    def ul(self, items): self.blocks.append(("ul", list(items)))
+    def ol(self, items): self.blocks.append(("ol", list(items)))
+    def code(self, t): self.blocks.append(("code", t))
+    def table(self, headers, rows): self.blocks.append(("table", headers, rows))
+    def kv(self, pairs): self.blocks.append(("kv", pairs))
+
+
+def cell_text(v, unredacted):
+    return v.show(unredacted) if isinstance(v, Secret) else ("" if v is None else str(v))
+
+
+def kv_key(key, v, unredacted):
+    """Flag whitespace a reader could not otherwise see on paper."""
+    if unredacted and isinstance(v, Secret) and v.kind == "secret" and v.plain:
+        t = v.plain
+        if "\n" not in t and (t != t.strip() or "  " in t):
+            return f"{key}  [{len(t)} characters, includes leading/trailing or repeated spaces]"
+    return key
+
+
+_MD_SPECIAL = re.compile(r"([\\`*_<\[\]|])")
+
+
+def md_text(s):
+    """Escape Markdown syntax in running text that came from the database."""
+    return _MD_SPECIAL.sub(r"\\\1", str(s)).replace("\n", " ")
+
+
+def md_code(t, in_table=True):
+    """Inline code span that reproduces t exactly (backticks, spaces and all)."""
+    if in_table:
+        t = t.replace("\n", " ⏎ ").replace("|", "\\|")   # \| is the GFM escape inside tables
+    longest = max((len(m) for m in re.findall(r"`+", t)), default=0)
+    fence = "`" * (longest + 1)
+    pad = " " if t.strip() and (t[0] in "` " or t[-1] in "` ") else ""
+    return f"{fence}{pad}{t}{pad}{fence}"
+
+
+def md_block(t):
+    longest = max((len(m) for m in re.findall(r"`+", t)), default=0)
+    fence = "`" * max(3, longest + 1)
+    return f"{fence}\n{t}\n{fence}"
+
+
+def render_md(doc: Doc, unredacted: bool) -> str:
+    out = []
+    for b in doc.blocks:
+        k = b[0]
+        if k in ("h1", "h2", "h3"):
+            out.append("#" * int(k[1]) + " " + md_text(b[1]) + "\n")
+        elif k == "p":
+            out.append(md_text(b[1]) + "\n")
+        elif k == "warn":
+            out.append("> **⚠ " + md_text(b[1]) + "**\n")
+        elif k == "ul":
+            out.append("\n".join(f"- {md_text(i)}" for i in b[1]) + "\n")
+        elif k == "ol":
+            out.append("\n".join(f"{n}. {md_text(i)}" for n, i in enumerate(b[1], 1)) + "\n")
+        elif k == "code":
+            out.append(md_block(b[1]) + "\n")
+        elif k == "table":
+            hdr, rows = b[1], b[2]
+            out.append("| " + " | ".join(md_text(h) for h in hdr) + " |")
+            out.append("|" + "---|" * len(hdr))
+            for r in rows:
+                cells = [cell_text(c, unredacted) for c in r]
+                out.append("| " + " | ".join(md_code(c) if c else "" for c in cells) + " |")
+            out.append("")
+        elif k == "kv":
+            simple, multi = [], []
+            for key, v in b[1]:
+                t = cell_text(v, unredacted)
+                key = kv_key(key, v, unredacted)
+                (multi if "\n" in t or len(t) > 90 else simple).append((key, t))
+            if simple:
+                out.append("| Setting | Value |\n|---|---|")
+                out += [f"| {md_text(a)} | {md_code(c) if c else ''} |" for a, c in simple]
+                out.append("")
+            for a, c in multi:
+                out.append(f"**{md_text(a)}:**\n{md_block(c)}\n")
+    return "\n".join(out)
+
+
+HTML_CSS = """
+:root{--fg:#1b1f24;--muted:#5b6470;--line:#d4d9df;--bg:#fff;--soft:#f4f6f8;--warn:#a31515;--warnbg:#fdecec}
+@media (prefers-color-scheme:dark){:root{--fg:#e6e9ed;--muted:#9aa4b1;--line:#353c45;--bg:#14171b;--soft:#1d2126;--warn:#ff8a80;--warnbg:#3a1717}}
+body{font:14px/1.45 system-ui,-apple-system,"Segoe UI",sans-serif;color:var(--fg);background:var(--bg);max-width:1100px;margin:0 auto;padding:24px 16px}
+h1{font-size:22px;border-bottom:2px solid var(--fg);padding-bottom:4px;margin-top:36px}
+h2{font-size:17px;margin-top:26px;border-bottom:1px solid var(--line)}
+h3{font-size:14px;margin:18px 0 6px;color:var(--muted)}
+table{border-collapse:collapse;width:100%;margin:6px 0 14px;font-size:12.5px}
+th,td{border:1px solid var(--line);padding:4px 6px;text-align:left;vertical-align:top;word-break:break-word}
+td{white-space:pre-wrap}
+th{background:var(--soft)}
+td.k{width:28%;color:var(--muted)}
+td.v,pre,code{font-family:ui-monospace,"DejaVu Sans Mono",monospace}
+pre{background:var(--soft);padding:8px;white-space:pre-wrap;word-break:break-all;font-size:12px;border:1px solid var(--line)}
+.warn{border:2px solid var(--warn);background:var(--warnbg);color:var(--warn);padding:10px 12px;font-weight:600;margin:12px 0}
+.wrap{overflow-x:auto}
+@media print{body{max-width:none;padding:0;font-size:11px}h1{page-break-before:always}h1:first-of-type{page-break-before:avoid}
+table,pre{page-break-inside:auto}tr{page-break-inside:avoid}.wrap{overflow:visible}}
+"""
+
+
+def render_html(doc: Doc, unredacted: bool, title: str) -> str:
+    e = html.escape
+    out = [f"<!doctype html><html lang='en'><head><meta charset='utf-8'>"
+           f"<meta name='viewport' content='width=device-width,initial-scale=1'>"
+           f"<title>{e(title)}</title><style>{HTML_CSS}</style></head><body>"]
+    for b in doc.blocks:
+        k = b[0]
+        if k in ("h1", "h2", "h3"):
+            out.append(f"<{k}>{e(b[1])}</{k}>")
+        elif k == "p":
+            out.append(f"<p>{e(b[1])}</p>")
+        elif k == "warn":
+            out.append(f"<div class='warn'>⚠ {e(b[1])}</div>")
+        elif k in ("ul", "ol"):
+            out.append(f"<{k}>" + "".join(f"<li>{e(i)}</li>" for i in b[1]) + f"</{k}>")
+        elif k == "code":
+            out.append(f"<pre>{e(b[1])}</pre>")
+        elif k == "table":
+            out.append("<div class='wrap'><table><tr>" + "".join(f"<th>{e(h)}</th>" for h in b[1]) + "</tr>")
+            for r in b[2]:
+                out.append("<tr>" + "".join(f"<td>{e(cell_text(c, unredacted))}</td>" for c in r) + "</tr>")
+            out.append("</table></div>")
+        elif k == "kv":
+            out.append("<table>")
+            for key, v in b[1]:
+                t = cell_text(v, unredacted)
+                key = kv_key(key, v, unredacted)
+                inner = f"<pre>{e(t)}</pre>" if "\n" in t or len(t) > 90 else e(t)
+                out.append(f"<tr><td class='k'>{e(key)}</td><td class='v'>{inner}</td></tr>")
+            out.append("</table>")
+    out.append("</body></html>")
+    return "\n".join(out)
+
+
+# ---------------------------------------------------------------------------
+# Section catalogue. Columns are matched by name; anything missing in this
+# TrueNAS version is skipped, so schema drift degrades gracefully.
+# ---------------------------------------------------------------------------
+
+class T:
+    def __init__(self, table, title, summary=None, where=None, single=False, order=None):
+        self.table, self.title, self.summary = table, title, summary or []
+        self.where, self.single, self.order = where, single, order
+
+
+def _not_builtin_user(ctx, r):
+    return ctx.builtin_users or not r.get("bsdusr_builtin") or r.get("bsdusr_username") == "root"
+
+
+def _not_builtin_group(ctx, r):
+    return ctx.builtin_users or not r.get("bsdgrp_builtin")
+
+
 SECTIONS = [
-    # ── System ────────────────────────────────────────────────────────────────
-    ("System Information",       "/system/info",              None, "kv"),
-    ("General Settings",         "/system/general",           None, "kv"),
-    ("Advanced Settings",        "/system/advanced",          None, "kv"),
-    ("NTP Servers",              "/system/ntpserver",         None, "table"),
-    ("Boot Environments",        "/bootenv",
-     ["id","name","active","activated","created","rawspace"], "table"),
-    ("Tunables",                 "/tunable",                  None, "table"),
-    ("Certificates",             "/certificate",
-     ["id","name","issuer","DN","from","until","key_type","key_length"], "table"),
-    ("Certificate Authorities",  "/certificateauthority",
-     ["id","name","issuer","DN","from","until"], "table"),
-
-    # ── Network ───────────────────────────────────────────────────────────────
-    ("Network Configuration",    "/network/configuration",    None, "kv"),
-    ("Network Interfaces",       "/interface",
-     ["id","name","type","state","aliases","ipv4_dhcp","ipv6_auto","mtu",
-      "lag_protocol","lag_ports","vlan_parent_interface","vlan_tag","description"], "table"),
-    ("Static Routes",            "/staticroute",              None, "table"),
-    ("IPMI Configuration",       "/ipmi",                     None, "kv"),
-
-    # ── Storage ───────────────────────────────────────────────────────────────
-    ("Storage Pools",            "/pool",
-     ["id","name","guid","status","path","healthy","is_decrypted","topology"], "cards"),
-    ("Datasets",                 "/pool/dataset",
-     ["id","name","type","used","available","compression",
-      "recordsize","quota","reservation","refquota","refreservation",
-      "readonly","acltype","casesensitivity","encrypted",
-      "deduplication","sync","snapdir","copies"], "table"),
-    ("Disks",                    "/disk",
-     ["identifier","name","serial","size","model","type",
-      "rotationrate","advpowermgmt","hddstandby","pool"], "table"),
-    ("Snapshot Tasks",           "/pool/snapshottask",        None, "table"),
-    ("Replication Tasks",        "/replication",              None, "cards"),
-    ("Scrub Tasks",              "/pool/scrub",               None, "table"),
-    ("Resilver Priority",        "/pool/resilver",            None, "kv"),
-
-    # ── Sharing ───────────────────────────────────────────────────────────────
-    ("SMB Shares",               "/sharing/smb",
-     ["id","name","path","enabled","home","ro","browsable","recyclebin",
-      "guestok","abe","acl","streams","durablehandle","comment"], "table"),
-    ("NFS Shares",               "/sharing/nfs",              None, "cards"),
-    ("iSCSI Global Config",      "/iscsi/global",             None, "kv"),
-    ("iSCSI Portals",            "/iscsi/portal",             None, "table"),
-    ("iSCSI Initiators",         "/iscsi/initiator",          None, "table"),
-    ("iSCSI Targets",            "/iscsi/target",             None, "cards"),
-    ("iSCSI Extents",            "/iscsi/extent",             None, "table"),
-    ("iSCSI Target-Extent Maps", "/iscsi/targetextent",       None, "table"),
-    ("WebDAV Shares",            "/sharing/webdav",           None, "table"),
-
-    # ── Services ──────────────────────────────────────────────────────────────
-    ("Services",                 "/service",
-     ["id","service","enable","state"], "table"),
-    ("SMB Configuration",        "/smb",                      None, "kv"),
-    ("NFS Configuration",        "/nfs",                      None, "kv"),
-    ("SSH Configuration",        "/ssh",                      None, "kv"),
-    ("S3 Configuration",         "/s3",                       None, "kv"),
-    ("FTP Configuration",        "/ftp",                      None, "kv"),
-    ("SNMP Configuration",       "/snmp",                     None, "kv"),
-    ("UPS Configuration",        "/ups",                      None, "kv"),
-
-    # ── Directory Services ────────────────────────────────────────────────────
-    ("Active Directory",         "/activedirectory",          None, "kv"),
-    ("LDAP",                     "/ldap",                     None, "kv"),
-    ("Kerberos Realms",          "/kerberos/realm",           None, "table"),
-    ("Kerberos Keytabs",         "/kerberos/keytab",
-     ["id","name"], "table"),
-
-    # ── Users & Groups ────────────────────────────────────────────────────────
-    ("Users",                    "/user",
-     ["id","uid","username","full_name","builtin","locked",
-      "shell","home","smb","email","sudo_commands"], "table"),
-    ("Groups",                   "/group",
-     ["id","gid","name","builtin","smb","sudo_commands","users"], "table"),
-
-    # ── Tasks ─────────────────────────────────────────────────────────────────
-    ("Cron Jobs",                "/cronjob",                  None, "cards"),
-    ("Cloud Sync Tasks",         "/cloudsync",                None, "cards"),
-    ("Rsync Tasks",              "/rsynctask",                None, "cards"),
-    ("SMART Tests",              "/smart/test",               None, "table"),
-
-    # ── Virtualisation / Apps ─────────────────────────────────────────────────
-    ("Virtual Machines",         "/vm",                       None, "cards"),
-    ("Apps (Chart Releases)",    "/chart/release",
-     ["id","name","status","human_version","update_available","portal_urls"], "table"),
-
-    # ── Alerts & Reporting ────────────────────────────────────────────────────
-    ("Active Alerts",            "/alert/list",               None, "cards"),
-    ("Alert Services",           "/alertservice",             None, "table"),
-    ("Reporting Config",         "/reporting",                None, "kv"),
-
-    # ── System Security ───────────────────────────────────────────────────────
-    ("Two-Factor Auth",          "/auth/twofactor",           None, "kv"),
-    ("Privileges",               "/privilege",                None, "table"),
-    ("API Keys",                 "/api_key",
-     ["id","name","created_at"], "table"),
-
-    # ── Legacy ────────────────────────────────────────────────────────────────
-    ("Jails",                    "/jail",                     None, "auto"),
-    ("Plugins",                  "/plugin",                   None, "auto"),
+    ("network", "Network", [
+        T("network_globalconfiguration", "Global network configuration", single=True),
+        T("network_interfaces", "Interfaces",
+          ["int_interface", "int_name", "int_dhcp", "int_address", "int_netmask",
+           "int_ipv6auto", "int_mtu", "int_link_address"]),
+        T("network_alias", "Interface aliases (static IPs)",
+          ["alias_interface_id", "alias_address", "alias_netmask", "alias_version"]),
+        T("network_vlan", "VLANs", ["vlan_vint", "vlan_pint", "vlan_tag", "vlan_description"]),
+        T("network_lagginterface", "Link aggregations", ["lagg_interface_id", "lagg_protocol"]),
+        T("network_lagginterfacemembers", "LAGG members",
+          ["lagg_interfacegroup_id", "lagg_physnic", "lagg_ordernum"]),
+        T("network_bridge", "Bridges", ["interface_id", "members", "stp"]),
+        T("network_staticroute", "Static routes", ["sr_destination", "sr_gateway", "sr_description"]),
+    ]),
+    ("storage", "Storage & data protection", [
+        T("storage_volume", "Pools", ["vol_name", "vol_guid"]),
+        T("storage_encrypteddataset", "Datasets with stored encryption keys", ["name", "kmip_uid"]),
+        T("storage_task", "Periodic snapshot tasks",
+          ["task_dataset", "task_recursive", "task_lifetime_value", "task_lifetime_unit",
+           "task_naming_schema", "task_enabled"], order="task_dataset"),
+        T("storage_replication", "Replication tasks",
+          ["repl_name", "repl_direction", "repl_transport", "repl_source_datasets",
+           "repl_target_dataset", "repl_ssh_credentials_id", "repl_auto", "repl_enabled"]),
+        T("storage_scrub", "Scrub tasks", ["scrub_volume_id", "scrub_threshold", "scrub_enabled"]),
+        T("tasks_smarttest", "S.M.A.R.T. tests", ["smarttest_type", "smarttest_all_disks", "smarttest_desc"]),
+        T("storage_disk", "Disks (as last seen)",
+          ["disk_name", "disk_serial", "disk_model", "disk_size", "disk_type", "disk_zfs_guid"],
+          order="disk_name"),
+    ]),
+    ("sharing", "Shares", [
+        T("sharing_cifs_share", "SMB shares",
+          ["cifs_name", "cifs_path", "cifs_purpose", "cifs_ro", "cifs_browsable",
+           "cifs_guestok", "cifs_enabled", "cifs_comment"], order="cifs_name"),
+        T("sharing_nfs_share", "NFS shares",
+          ["nfs_path", "nfs_paths", "nfs_networks", "nfs_hosts", "nfs_ro",
+           "nfs_maproot_user", "nfs_mapall_user", "nfs_enabled"]),
+        T("services_iscsitarget", "iSCSI targets", ["iscsi_target_name", "iscsi_target_alias", "iscsi_target_mode"]),
+        T("services_iscsitargetextent", "iSCSI extents",
+          ["iscsi_target_extent_name", "iscsi_target_extent_type", "iscsi_target_extent_path",
+           "iscsi_target_extent_filesize", "iscsi_target_extent_blocksize", "iscsi_target_extent_enabled"]),
+        T("services_iscsitargettoextent", "iSCSI target ↔ extent mappings",
+          ["iscsi_target_id", "iscsi_extent_id", "iscsi_lunid"]),
+        T("services_iscsitargetgroups", "iSCSI target groups",
+          ["iscsi_target_id", "iscsi_target_portalgroup_id", "iscsi_target_initiatorgroup_id",
+           "iscsi_target_authtype", "iscsi_target_authgroup"]),
+        T("services_iscsitargetportal", "iSCSI portals", ["iscsi_target_portal_tag", "iscsi_target_portal_comment"]),
+        T("services_iscsitargetportalip", "iSCSI portal IPs",
+          ["iscsi_target_portalip_portal_id", "iscsi_target_portalip_ip"]),
+        T("services_iscsitargetauthorizedinitiator", "iSCSI initiator groups",
+          ["iscsi_target_initiator_initiators", "iscsi_target_initiator_comment"]),
+        T("services_iscsitargetauthcredential", "iSCSI CHAP credentials",
+          ["iscsi_target_auth_tag", "iscsi_target_auth_user", "iscsi_target_auth_secret",
+           "iscsi_target_auth_peeruser"]),
+    ]),
+    ("accounts", "Users & groups", [
+        T("account_bsdusers", "Users",
+          ["bsdusr_uid", "bsdusr_username", "bsdusr_full_name", "bsdusr_group_id",
+           "bsdusr_home", "bsdusr_shell", "bsdusr_smb", "bsdusr_locked",
+           "bsdusr_password_disabled", "bsdusr_email"],
+          where=_not_builtin_user, order="bsdusr_uid"),
+        T("account_bsdgroups", "Groups", ["bsdgrp_gid", "bsdgrp_group", "bsdgrp_smb", "bsdgrp_sudo"],
+          where=_not_builtin_group, order="bsdgrp_gid"),
+        T("account_bsdgroupmembership", "Supplementary group membership",
+          ["bsdgrpmember_group_id", "bsdgrpmember_user_id"]),
+        T("account_twofactor_user_auth", "Two-factor enrolment", ["user_id", "secret"]),
+    ]),
+    ("services", "Services", [
+        T("services_services", "Service state", ["srv_service", "srv_enable"], order="srv_service"),
+        T("services_ssh", "SSH service", single=True),
+        T("services_cifs", "SMB service", single=True),
+        T("services_nfs", "NFS service", single=True),
+        T("services_ups", "UPS service", single=True),
+        T("services_snmp", "SNMP service", single=True),
+        T("services_ftp", "FTP service", single=True),
+        T("services_iscsitargetglobalconfiguration", "iSCSI global settings", single=True),
+    ]),
+    ("offsite", "Cloud, offsite & credentials", [
+        T("system_cloudcredentials", "Cloud credentials", ["name", "provider", "attributes"]),
+        T("tasks_cloudsync", "Cloud sync tasks",
+          ["description", "direction", "transfer_mode", "path", "credential_id",
+           "encryption", "enabled"]),
+        T("tasks_cloud_backup", "TrueCloud backup tasks",
+          ["description", "path", "credentials_id", "keep_last", "enabled"]),
+        T("tasks_rsync", "Rsync tasks",
+          ["rsync_desc", "rsync_path", "rsync_remotehost", "rsync_remotepath", "rsync_mode",
+           "rsync_direction", "rsync_enabled"]),
+        T("system_keychaincredential", "SSH keypairs & connections (keychain)", ["name", "type"]),
+        T("system_kmip", "KMIP", single=True),
+    ]),
+    ("system", "System", [
+        T("system_settings", "General settings", single=True),
+        T("system_advanced", "Advanced settings", single=True),
+        T("system_ntpserver", "NTP servers", ["ntp_address", "ntp_burst", "ntp_iburst", "ntp_prefer"]),
+        T("system_email", "Email (SMTP)", single=True),
+        T("system_alertservice", "Alert services", ["name", "type", "enabled", "level"]),
+        T("system_certificate", "Certificates", ["cert_name", "cert_type", "cert_san"]),
+        T("system_tunable", "Tunables", ["tun_var", "tun_value", "tun_type", "tun_enabled", "tun_comment"]),
+        T("tasks_cronjob", "Cron jobs",
+          ["cron_description", "cron_user", "cron_command", "cron_enabled"]),
+        T("tasks_initshutdown", "Init/shutdown scripts",
+          ["ini_type", "ini_command", "ini_script", "ini_when", "ini_enabled", "ini_comment"]),
+        T("directoryservice_activedirectory", "Active Directory", single=True),
+        T("directoryservice_ldap", "LDAP", single=True),
+        T("directoryservices", "Directory services", single=True),
+        T("system_ui", "Web UI", single=True),
+    ]),
+    ("vms", "Virtual machines & containers", [
+        T("vm_vm", "Virtual machines", ["name", "vcpus", "cores", "threads", "memory",
+                                        "bootloader", "autostart", "description"]),
+        T("vm_device", "VM devices", ["vm_id", "dtype", "order", "attributes"]),
+        T("container_container", "Containers (Incus)", ["name", "autostart"]),
+    ]),
 ]
 
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  REDACTION
-# ═══════════════════════════════════════════════════════════════════════════════
-REDACT_FIELDS = {
-    "password", "secret", "token", "apikey", "api_key", "bindpw",
-    "unixhash", "smbhash", "nt_hash", "lm_hash", "private_key",
-    "secret_seed", "csr", "privatekey",
-    "encryption_password", "encryption_salt",
-    "pass", "secret_key", "client_secret", "refresh_token",
-    "access_key_id", "secret_access_key",
-}
-
-REDACT_SUBSTRINGS = (
-    "password", "secret", "token", "private_key", "apikey", "api_key",
-    "credential", "passphrase", "auth_key", "hmac",
-)
-
-SKIP_KEYS = {"id", "url", "uri"}
+SKIP_TABLES_RE = re.compile(r"^(sqlite_|alembic_|django_|auth_|sessions?$)")
 
 
-# ═══════════════════════════════════════════════════════════════════════════════
-#  HELPERS
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def should_redact(key):
-    k = key.lower()
-    if k in REDACT_FIELDS:
+def render_table_spec(ctx: Ctx, doc: Doc, spec: T):
+    ctx.covered.add(spec.table)
+    raw = ctx.rows(spec.table, spec.order)
+    if raw is None:
+        return False
+    if spec.where:
+        raw = [r for r in raw if spec.where(ctx, r)]
+    doc.h2(spec.title)
+    if not raw:
+        doc.p("None configured.")
         return True
-    for trigger in REDACT_SUBSTRINGS:
-        if trigger in k:
+    labels, rows, colmap = ctx.process(spec.table, raw)
+    title_col = ctx.label_col(spec.table)
+
+    if spec.single or len(raw) == 1 and not spec.summary:
+        for r in rows:
+            doc.kv([(l, r[l]) for l in labels if l != "id" and _keep(r[l], ctx.full)])
+        return True
+
+    # summary table
+    want = [colmap[c] for c in spec.summary if c in colmap] if spec.summary else []
+    # schedule column joins summary if the table has one
+    want += [l for l in labels if l.endswith("schedule") and l not in want]
+    if not want:
+        want = [l for l in labels if l != "id"][:7]
+    extra = _extras(ctx, spec.table, rows)
+    hdr = want + list(extra[0].keys()) if extra else want
+    doc.table(hdr, [[r[l] for l in want] + (list(extra[i].values()) if extra else [])
+                    for i, r in enumerate(rows)])
+
+    shown = set(want) | {"id"}
+    if ctx.full and any(l not in shown for l in labels):
+        for r in rows:
+            name = r["__raw__"].get(title_col) if title_col else None
+            doc.h3(f"{spec.title} — {name or '#' + str(r['__raw__'].get('id'))}")
+            doc.kv([(l, r[l]) for l in labels if l != "id" and _keep(r[l], True)])
+    return True
+
+
+def _keep(v, full):
+    if full:
+        return True
+    return not (v in ("", None) or (isinstance(v, Secret) and not v.present()))
+
+
+def _extras(ctx, table, rows):
+    """Derived columns: certificate subject/expiry."""
+    if table != "system_certificate" or not HAVE_CRYPTO:
+        return None
+    out = []
+    for r in rows:
+        pem = r["__raw__"].get("cert_certificate")
+        info = {"subject": "", "expires": ""}
+        if pem:
+            try:
+                c = x509.load_pem_x509_certificate(pem.encode())
+                info["subject"] = c.subject.rfc4514_string()
+                na = getattr(c, "not_valid_after_utc", None) or c.not_valid_after
+                info["expires"] = na.strftime("%Y-%m-%d")
+            except Exception:
+                info["subject"] = "(unparseable)"
+        out.append(info)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Building the document
+# ---------------------------------------------------------------------------
+
+def scalar(ctx, table, col, default=""):
+    if table not in ctx.tables or col not in [c for c, _ in ctx.cols(table)]:
+        return default
+    r = ctx.conn.execute(f"SELECT {qi(col)} FROM {qi(table)} LIMIT 1").fetchone()
+    return default if r is None or r[0] is None else r[0]
+
+
+def column(ctx, table, col):
+    if table not in ctx.tables or col not in [c for c, _ in ctx.cols(table)]:
+        return []
+    return [r[0] for r in ctx.conn.execute(f"SELECT {qi(col)} FROM {qi(table)}") if r[0] is not None]
+
+
+def hostname(ctx):
+    h = clean(scalar(ctx, "network_globalconfiguration", "gc_hostname", "")) or "truenas"
+    d = clean(scalar(ctx, "network_globalconfiguration", "gc_domain", ""))
+    return h, (f"{h}.{d}" if d else h)
+
+
+def safe_name(text) -> str:
+    """Hostname as a filename component: no path separators, no leading dot."""
+    return re.sub(r"[^A-Za-z0-9._-]", "_", str(text)).lstrip(".") or "truenas"
+
+
+def release_from_filename(path):
+    """TrueNAS names exports <host>-<release>-<date>.tar; the database itself holds no release."""
+    m = re.search(r"(?<![\d.])(\d{2}\.\d{1,2}(?:\.\d{1,3}){0,3})(?![\d])", os.path.basename(path))
+    return m.group(1) if m else None
+
+
+def build_doc(ctx: Ctx, sections: list[str], appendix: bool) -> Doc:
+    doc = Doc()
+    host, fqdn = hostname(ctx)
+    now = dt.datetime.now().astimezone()
+    cfg = ctx.cfg
+
+    doc.h1(f"Disaster Recovery Record — {fqdn}")
+    if ctx.unredacted:
+        doc.warn("UNREDACTED — this document contains plaintext passwords, keys and "
+                 "credentials. Store it offline (fire safe, encrypted media) and destroy "
+                 "superseded copies.")
+    release = release_from_filename(cfg.path)
+    header = [
+        ("Hostname", fqdn),
+        ("Generated", now.strftime("%Y-%m-%d %H:%M %Z")),
+        ("Source file", os.path.basename(cfg.path)),
+        ("Source SHA-256", cfg.sha256),
+        ("Source size", f"{cfg.size:,} bytes"),
+        ("Archive contents", ", ".join(f"{n} ({s:,} B)" for n, s in cfg.members)),
+        ("Secret seed present", "yes" if cfg.secret else
+         "NO — encrypted fields cannot be restored or read"),
+        ("TrueNAS release", release + "  (read from the export's file name)" if release else
+         "not recorded in the export — write it here by hand"),
+        ("Database schema revision", str(scalar(ctx, "alembic_version", "version_num", "unknown"))),
+        ("Time zone", str(scalar(ctx, "system_settings", "stg_timezone", ""))),
+        ("Mode", "UNREDACTED" if ctx.unredacted else "redacted"),
+        ("Detail", "full" if ctx.full else "summary"),
+        ("Generator", f"truenas_config_dr.py v{VERSION}"),
+    ]
+    doc.kv(header)   # the decryption result is appended once the sections are built
+
+    doc.h1("Restore runbook")
+    pools = [str(x) for x in column(ctx, "storage_volume", "vol_name")]
+    enc_rows = ctx.rows("storage_encrypteddataset") or []
+    keyed = [r for r in enc_rows if r.get("encryption_key") not in (None, "")]
+    repl = ctx.rows("storage_replication") or []
+    ifaces = [str(x) for x in column(ctx, "network_interfaces", "int_interface")]
+    doc.ol([
+        "Install TrueNAS on the replacement boot device — the same release that produced "
+        "this export, or a newer one"
+        + (f" (this export came from {release})." if release else
+           " (the release is not stored in the export; it is normally part of the file name)."),
+        "Bring up the management interface from the console so the web UI is reachable "
+        + (f"(original interfaces: {', '.join(ifaces)}). " if ifaces else ". ")
+        + "Interface names can change on new hardware; re-map them after restore.",
+        f"Upload the configuration: System > General Settings > Manage Configuration > "
+        f"Upload File, using the export whose SHA-256 is {cfg.sha256[:16]}…. "
+        "The box reboots with this configuration.",
+        "Check the pool(s). Pools recorded in the config import on boot when their disks "
+        "are attached; if one is missing use Storage > Import Pool"
+        + (f" — expected: {', '.join(pools)}." if pools else "."),
+        f"Unlock encrypted datasets. {len(keyed)} dataset(s) have an encryption key stored "
+        "in this config (listed under Storage) and can be unlocked from it. "
+        "Passphrase-protected datasets are NOT recoverable from this file — their "
+        "passphrases must come from your separate offline record.",
+        "Re-map interfaces, VLANs and LAGGs if NIC names changed, then test reachability "
+        "of every share (SMB/NFS/iSCSI listed below).",
+        f"Verify replication ({len(repl)} task(s)): confirm SSH connections succeed and the "
+        "first run after restore is incremental, not a full resend.",
+        "Verify cloud sync / backup tasks run and their encryption passwords still decrypt "
+        "existing remote data.",
+        "Re-deploy apps: app data lives in the ix-apps dataset on the pool, not in the "
+        "config file; confirm the apps pool is selected and apps start.",
+        "Run a scrub, check alerts, and confirm snapshot tasks and canary/cron jobs fire.",
+    ])
+    doc.h2("What this file does NOT contain")
+    doc.ul([
+        "Pool data, snapshots, or the ix-apps dataset (app configuration and data).",
+        "Passphrases for passphrase-encrypted datasets or pools.",
+        "Anything outside the TrueNAS database: files in home directories, scripts stored "
+        "on pools, BIOS/IPMI settings, switch/firewall config.",
+        "Credentials held elsewhere (password manager, cloud provider consoles, "
+        "offline prune keys, Object Lock credentials).",
+    ])
+    if not cfg.secret:
+        doc.warn("This export has no secret seed. On restore, every stored password "
+                 "(SMTP, cloud credentials, SSH keypairs, cloud-sync encryption, CHAP) "
+                 "will be unusable. Re-export with 'Export Password Secret Seed' ticked.")
+
+    for key, title, specs in SECTIONS:
+        if key not in sections:
+            for s in specs:
+                ctx.covered.add(s.table)
+            continue
+        doc.h1(title)
+        any_rendered = False
+        for spec in specs:
+            any_rendered |= render_table_spec(ctx, doc, spec)
+        if not any_rendered:
+            doc.p("No tables for this section exist in this TrueNAS version.")
+
+    if appendix:
+        rest = sorted(t for t in ctx.tables
+                      if t not in ctx.covered and not SKIP_TABLES_RE.match(t))
+        nonempty = []
+        for t in rest:
+            n = ctx.conn.execute(f"SELECT count(*) FROM {qi(t)}").fetchone()[0]
+            if n:
+                nonempty.append((t, n))
+        doc.h1("Appendix — all other configuration tables")
+        doc.p(f"{len(nonempty)} further non-empty tables, rendered generically. "
+              "Secrets follow the same redaction rules.")
+        for t, n in nonempty:
+            spec = T(t, f"{t} ({n} row{'s' if n != 1 else ''})", single=(n == 1))
+            ctx.covered.discard(t)
+            render_table_spec(ctx, doc, spec)
+
+    st = ctx.stats
+    header.insert(7, ("Encrypted fields", f"{st['decrypted']} decrypted, "
+                      f"{st['undecryptable']} could not be read"))
+    if cfg.secret and st["undecryptable"] and not st["decrypted"]:
+        doc.blocks.insert(1, ("warn", "None of the encrypted fields could be decrypted with the "
+                              "secret seed supplied. " + ctx._why_unreadable().capitalize() + "."))
+    return doc
+
+
+# ---------------------------------------------------------------------------
+# Output
+# ---------------------------------------------------------------------------
+
+def _private_temp(final_path: str):
+    """New 0600 file next to final_path (O_EXCL, so no symlink or stale-permission surprises)."""
+    return tempfile.mkstemp(prefix=".dr-", suffix=".part", dir=os.path.dirname(final_path) or ".")
+
+
+def write_secure(path: str, data: bytes):
+    fd, tmp = _private_temp(path)
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def gpg_key_usable(recipient: str) -> bool:
+    """True if the local keyring has a key for recipient that can encrypt."""
+    try:
+        r = subprocess.run(["gpg", "--batch", "--with-colons", "--list-keys", "--", recipient],
+                           capture_output=True, text=True)
+    except OSError:
+        return False
+    if r.returncode != 0:
+        return False
+    for line in r.stdout.splitlines():
+        f = line.split(":")
+        # pub/sub records: field 2 = validity (r/e/d/i are unusable), field 12 = capabilities
+        if f[0] in ("pub", "sub") and len(f) > 11 and f[1] not in ("r", "e", "d", "i") and "e" in f[11]:
             return True
     return False
 
 
-def redact(obj):
-    if not REDACT_ENABLED:
-        return obj
-    if isinstance(obj, dict):
-        return {k: ("***REDACTED***" if should_redact(k) else redact(v))
-                for k, v in obj.items()}
-    if isinstance(obj, list):
-        return [redact(i) for i in obj]
-    return obj
-
-
-def filter_keys(data, keys):
-    if keys is None or not isinstance(data, list):
-        return data
-    return [{k: row.get(k) for k in keys if k in row} for row in data if isinstance(row, dict)]
-
-
-def fetch(session, base, endpoint):
-    url = urljoin(base.rstrip("/") + "/", "api/v2.0" + endpoint)
+def write_gpg(path: str, data: bytes, recipient: str | None, symmetric: bool):
+    out = path + ".gpg"
+    fd, tmp = _private_temp(out)
+    os.close(fd)
+    cmd = ["gpg", "--yes", "--auto-key-locate", "local", "--output", tmp]  # never fetch keys over the network
+    if symmetric:
+        cmd += ["--symmetric", "--cipher-algo", "AES256"]
+    else:
+        cmd += ["--encrypt", "--recipient", recipient]
+    env = dict(os.environ)
+    if "GPG_TTY" not in env:  # data goes over stdin, so tell pinentry where the terminal is
+        for stream in (sys.stdin, sys.stdout, sys.stderr):
+            try:
+                env["GPG_TTY"] = os.ttyname(stream.fileno())
+                break
+            except (OSError, ValueError, AttributeError):
+                pass
     try:
-        r = session.get(url, timeout=30)
-        if r.status_code == 404:
-            return None, "endpoint not available (404)"
-        if r.status_code == 401:
-            return None, "authentication failed (401)"
-        r.raise_for_status()
+        r = subprocess.run(cmd, input=data, capture_output=True, env=env)
+        if r.returncode != 0 or os.path.getsize(tmp) == 0:
+            raise RuntimeError("gpg failed, nothing was written: "
+                               + (r.stderr.decode(errors="replace").strip() or f"exit {r.returncode}"))
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, out)
+    except BaseException:
         try:
-            return r.json(), None
-        except ValueError:
-            # Non-JSON body; ValueError is the portable parent of JSONDecodeError
-            return r.text[:500], None
-    except Exception as e:
-        return None, str(e)
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    return out
 
 
-def post(session, base, endpoint, payload=None):
-    url = urljoin(base.rstrip("/") + "/", "api/v2.0" + endpoint)
-    try:
-        r = session.post(url, json=payload or {}, timeout=60)
-        if r.status_code == 404:
-            return None, "endpoint not available (404)"
-        r.raise_for_status()
+def emit(ctx, doc, formats, outdir, gpg_recipient=None, gpg_symmetric=False):
+    host, fqdn = hostname(ctx)
+    stamp = dt.datetime.now().strftime("%Y-%m-%d_%H%M%S")
+    tag = "UNREDACTED" if ctx.unredacted else "redacted"
+    encrypt = gpg_symmetric or gpg_recipient is not None
+    if gpg_recipient is not None and not gpg_recipient.strip():
+        raise RuntimeError("GPG recipient is empty — refusing to fall back to plaintext output.")
+    if encrypt and not shutil.which("gpg"):
+        raise RuntimeError("gpg is not installed — refusing to fall back to plaintext output.")
+    os.makedirs(outdir, mode=0o700, exist_ok=True)
+    base = os.path.join(outdir, f"{safe_name(host)}_DR_{stamp}_{tag}")
+    # render everything first so a rendering error cannot leave half the set on disk
+    rendered = [(fmt, (render_md(doc, ctx.unredacted) if fmt == "md"
+                       else render_html(doc, ctx.unredacted, f"DR record — {fqdn}")).encode("utf-8"))
+                for fmt in formats]
+    results = []
+    for fmt, data in rendered:
+        path = f"{base}.{fmt}"
+        if encrypt:
+            path = write_gpg(path, data, gpg_recipient, gpg_symmetric)
+        else:
+            write_secure(path, data)
+        results.append(path)
+    return results
+
+
+# ---------------------------------------------------------------------------
+# Interactive wizard
+# ---------------------------------------------------------------------------
+
+def ask(prompt, default=None, choices=None):
+    while True:
+        suffix = f" [{default}]" if default not in (None, "") else ""
         try:
-            return r.json(), None
-        except ValueError:
-            # Non-JSON body; ValueError is the portable parent of JSONDecodeError
-            return r.text[:500], None
-    except Exception as e:
-        return None, str(e)
+            ans = input(f"{prompt}{suffix}: ").strip()
+        except EOFError:
+            print()
+            sys.exit("Aborted.")
+        if not ans and default is not None:
+            ans = str(default)
+        if choices is None or ans.lower() in choices:
+            return ans
+        print(f"  Please answer one of: {', '.join(choices)}")
 
 
-def wait_job(session, base, job_id, timeout=60, interval=2):
-    """Poll /core/get_jobs until a job finishes. Returns (result, error)."""
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        jobs, err = post(session, base, "/core/get_jobs", [[["id", "=", job_id]]])
-        if err:
-            return None, err
-        job = jobs[0] if isinstance(jobs, list) and jobs else None
-        if not isinstance(job, dict):
-            return None, f"job {job_id} not found"
-        state = job.get("state")
-        if state == "SUCCESS":
-            return job.get("result"), None
-        if state in ("FAILED", "ABORTED"):
-            return None, str(job.get("error") or state)
-        time.sleep(interval)
-    return None, f"job {job_id} timed out after {timeout}s"
+def yesno(prompt, default=False):
+    a = ask(prompt + " (y/n)", "y" if default else "n", ["y", "n", "yes", "no"])
+    return a.lower().startswith("y")
 
 
-def prompt_config():
-    global TRUENAS_HOST, TRUENAS_APIKEY, OUTPUT_DIR, REDACT_ENABLED
+def find_candidates():
+    dirs = [os.getcwd(), os.path.expanduser("~/Downloads")]
+    found = []
+    for d in dirs:
+        try:
+            for f in os.listdir(d):
+                p = os.path.join(d, f)
+                if f.lower().endswith((".tar", ".db", ".tar.gz", ".tgz")) and os.path.isfile(p):
+                    found.append(p)
+        except OSError:
+            pass
+    return sorted(set(found), key=os.path.getmtime, reverse=True)[:9]
 
-    # ── Check env vars first (for unattended runs) ────────────────────────────
-    env_redact = os.environ.get("TRUENAS_REDACT", "").lower()
-    if env_redact == "false":
-        REDACT_ENABLED = False
 
-    if not TRUENAS_HOST:
-        TRUENAS_HOST = input("TrueNAS URL (e.g. https://10.0.0.5): ").strip()
-    if not TRUENAS_APIKEY:
-        TRUENAS_APIKEY = getpass.getpass("API Key: ").strip()
-    if not OUTPUT_DIR or OUTPUT_DIR == ".":
-        default = str(Path.home() / "Documents")
-        choice = input(f"Output directory [{default}]: ").strip()
-        OUTPUT_DIR = choice if choice else default
+def wizard(args):
+    print(f"\nTrueNAS config → DR document  (v{VERSION})\n" + "=" * 44)
+    print("Works offline from a config export. Nothing connects to your NAS.\n")
 
-    # ── Redaction prompt (skip if already set via env) ────────────────────────
-    if env_redact:
-        if not REDACT_ENABLED:
-            print("\n  ⚠  TRUENAS_REDACT=false — redaction DISABLED via environment\n")
-        return
-
-    print("")
-    print("  ╔══════════════════════════════════════════════════════════╗")
-    print("  ║  REDACTION OPTIONS                                      ║")
-    print("  ║                                                          ║")
-    print("  ║  1. Redacted     — passwords/keys replaced with ***     ║")
-    print("  ║                    Safe to share, store, or email.       ║")
-    print("  ║                                                          ║")
-    print("  ║  2. Unredacted   — ALL secrets in plain text            ║")
-    print("  ║                    For fire safe / disaster recovery.    ║")
-    print("  ║                                                          ║")
-    print("  ║  ⚠  Unredacted output contains credentials, API keys,  ║")
-    print("  ║     encryption passwords, and service secrets.           ║")
-    print("  ║     Store on encrypted media or in a physical safe.      ║")
-    print("  ╚══════════════════════════════════════════════════════════╝")
-    choice = input("\n  Select [1]: ").strip()
-
-    if choice == "2":
-        print("")
-        print("  ┌──────────────────────────────────────────────────────┐")
-        print("  │  You are about to generate a document containing     │")
-        print("  │  ALL credentials and secrets in PLAIN TEXT.          │")
-        print("  │                                                      │")
-        print("  │  This includes:                                      │")
-        print("  │    • User password hashes                            │")
-        print("  │    • Cloud storage access keys                       │")
-        print("  │    • Encryption passwords and salts                  │")
-        print("  │    • API tokens and service credentials              │")
-        print("  │    • Active Directory bind passwords                 │")
-        print("  │    • Private keys and certificates                   │")
-        print("  └──────────────────────────────────────────────────────┘")
-        confirm = input("\n  Type 'yes' to confirm, anything else to cancel: ").strip().lower()
-        if confirm == "yes":
-            REDACT_ENABLED = False
-            print("\n  → Redaction DISABLED — output will contain plain text secrets")
-            print("  → Filename will be tagged UNREDACTED for identification\n")
+    # 1. file
+    path = args.config
+    if not path:
+        cands = find_candidates()
+        if cands:
+            print("Config exports found:")
+            for i, c in enumerate(cands, 1):
+                ts = dt.datetime.fromtimestamp(os.path.getmtime(c)).strftime("%Y-%m-%d %H:%M")
+                print(f"  {i}. {c}  ({ts})")
+            a = ask("Pick a number or type a path", "1")
+            path = cands[int(a) - 1] if a.isdigit() and 0 < int(a) <= len(cands) else a
         else:
-            REDACT_ENABLED = True
-            print("\n  → Cancelled. Keeping redaction enabled.\n")
-    else:
-        REDACT_ENABLED = True
-        print("\n  → Redaction enabled — secrets will be masked\n")
+            path = ask("Path to config export (.tar or .db)")
+    path = path.strip()
+    if len(path) > 1 and path[0] == path[-1] and path[0] in "'\"":   # dragged-in paths arrive quoted
+        path = path[1:-1]
+    path = os.path.expanduser(path)
+    cfg = load_config(path, args.seed)
+    probe = Ctx(cfg, False, False, False)
+    host, fqdn = hostname(probe)
+    pw_ok = probe.pw.available
+    print(f"\n  Host:         {fqdn}")
+    print(f"  Tables:       {len(probe.tables)}")
+    print(f"  Secret seed:  {'present' if cfg.secret else 'MISSING'}")
+    print(f"  Decryption:   {'available' if pw_ok else 'unavailable'}"
+          + ("" if pw_ok or not cfg.secret else
+             "  (install python3-cryptography)" if not HAVE_CRYPTO else
+             f"  (secret seed is {len(cfg.secret)} bytes; expected 32)"))
+    print(f"  SHA-256:      {cfg.sha256}\n")
 
-
-def fmt_val(v, max_len=80):
-    if v is None or v == "" or v == []:
-        return "—"
-    if isinstance(v, bool):
-        return "Yes" if v else "No"
-    if isinstance(v, dict):
-        if "value" in v and "source" in v:
-            return fmt_val(v["value"], max_len)
-        if "parsed" in v and "rawvalue" in v:
-            return fmt_val(v["parsed"], max_len)
-        if len(v) <= 3:
-            parts = [f"{k}: {fmt_val(val, 30)}" for k, val in v.items()]
-            return " · ".join(parts)
-        return f"[{len(v)} fields]"
-    if isinstance(v, list):
-        if all(isinstance(i, (str, int, float, bool)) for i in v):
-            joined = ", ".join(str(i) for i in v)
-            return joined[:max_len] + ("…" if len(joined) > max_len else "")
-        if all(isinstance(i, dict) for i in v):
-            return f"[{len(v)} items]"
-        return str(v)[:max_len]
-    s = str(v)
-    return s[:max_len] + ("…" if len(s) > max_len else "")
-
-
-def fmt_bytes(n):
-    try:
-        n = int(n)
-    except (TypeError, ValueError):
-        return str(n)
-    for unit in ("B", "KB", "MB", "GB", "TB", "PB"):
-        if abs(n) < 1024:
-            return f"{n:.1f} {unit}"
-        n /= 1024
-    return f"{n:.1f} EB"
-
-
-def pretty_key(k):
-    return k.replace("_", " ").replace(".", " > ").title()
-
-
-def pipe_escape(s):
-    return str(s).replace("|", "\\|")
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  FORMATTERS
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def format_kv(data):
-    if not isinstance(data, dict):
-        return f"```\n{data}\n```\n"
-    lines = ["| Setting | Value |", "| :--- | :--- |"]
-    for k, v in data.items():
-        if k.lower() in SKIP_KEYS:
-            continue
-        lines.append(f"| **{pipe_escape(pretty_key(k))}** | {pipe_escape(fmt_val(v))} |")
-    return "\n".join(lines) + "\n"
-
-
-def format_table(records):
-    if not records or not isinstance(records[0], dict):
-        return None
-    headers = [k for k in records[0].keys() if k.lower() not in SKIP_KEYS]
-    if not headers:
-        headers = list(records[0].keys())
-    lines = [
-        "| " + " | ".join(pretty_key(h) for h in headers) + " |",
-        "| " + " | ".join(":---" for _ in headers) + " |",
-    ]
-    for row in records:
-        cells = [pipe_escape(fmt_val(row.get(h), 60)) for h in headers]
-        lines.append("| " + " | ".join(cells) + " |")
-    return "\n".join(lines) + "\n"
-
-
-def format_cards(records):
-    if not records:
-        return None
-    parts = []
-    for i, row in enumerate(records):
-        if not isinstance(row, dict):
-            parts.append(f"- {row}")
-            continue
-        title = row.get("name") or row.get("id") or row.get("service") or f"Item {i+1}"
-        parts.append(f"### {pipe_escape(fmt_val(title, 120))}\n")
-        parts.append("| Setting | Value |")
-        parts.append("| :--- | :--- |")
-        for k, v in row.items():
-            if k.lower() in SKIP_KEYS:
-                continue
-            parts.append(f"| **{pipe_escape(pretty_key(k))}** | {pipe_escape(fmt_val(v))} |")
-        parts.append("")
-    return "\n".join(parts) + "\n"
-
-
-def format_auto(data):
-    if isinstance(data, dict):
-        return format_kv(data)
-    if isinstance(data, list) and data:
-        if isinstance(data[0], dict):
-            sample = data[0]
-            nested = sum(1 for v in sample.values() if isinstance(v, (dict, list)))
-            if nested > len(sample) * 0.4:
-                return format_cards(data)
-            return format_table(data)
-    return f"```\n{json.dumps(data, indent=2)}\n```\n"
-
-
-def format_section(data, mode):
-    if isinstance(data, list) and not data:
-        return "*No entries configured.*\n"
-    if mode == "kv":
-        return format_kv(data)
-    elif mode == "table":
-        if isinstance(data, list) and data and isinstance(data[0], dict):
-            return format_table(data) or format_auto(data)
-        return format_kv(data) if isinstance(data, dict) else format_auto(data)
-    elif mode == "cards":
-        if isinstance(data, list) and data and isinstance(data[0], dict):
-            return format_cards(data) or format_auto(data)
-        return format_kv(data) if isinstance(data, dict) else format_auto(data)
-    else:
-        return format_auto(data)
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  PART 2 — DEEP DIVE APPENDIX BUILDERS
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def appendix_pool_health(session, base):
-    """Pool status, capacity, topology detail, and vdev health."""
-    lines = ["## A1 — Pool Health & Capacity\n"]
-    pools, err = fetch(session, base, "/pool")
-    if err:
-        lines.append(f"*Skipped — {err}*\n")
-        return "\n".join(lines)
-    if not pools:
-        lines.append("*No pools found.*\n")
-        return "\n".join(lines)
-
-    for pool in pools:
-        name = pool.get("name", "unknown")
-        lines.append(f"### Pool: {name}\n")
-        lines.append("| Property | Value |")
-        lines.append("| :--- | :--- |")
-        lines.append(f"| **Status** | {pool.get('status', '—')} |")
-        lines.append(f"| **Healthy** | {'Yes' if pool.get('healthy') else 'No'} |")
-        lines.append(f"| **GUID** | {pool.get('guid', '—')} |")
-        lines.append(f"| **Path** | {pool.get('path', '—')} |")
-        lines.append(f"| **Encrypted** | {fmt_val(pool.get('is_decrypted', '—'))} |")
-        scan = pool.get("scan")
-        if isinstance(scan, dict):
-            scan_func = scan.get("function", "—")
-            scan_state = scan.get("state", "—")
-            scan_end = scan.get("end_time", scan.get("end", "—"))
-            scan_errs = scan.get("errors", 0)
-            lines.append(f"| **Last Scan** | {scan_func} — {scan_state} (ended {fmt_val(scan_end)}, {scan_errs} errors) |")
+    # 2. mode
+    print("Output mode:\n  1. Redacted — secrets shown as [set]/[empty]  (safe to share/print)\n"
+          "  2. UNREDACTED — plaintext passwords and keys  (offline vault copy only)")
+    mode = ask("Choose", "1", ["1", "2"])
+    unredacted = False
+    if mode == "2":
+        if not pw_ok:
+            print("  ! Without the secret seed and python3-cryptography, encrypted fields "
+                  "can't be decrypted; only plain-stored secrets will appear.")
+        print(f"\n  To confirm, type the hostname exactly ({host}):")
+        if ask("  Hostname") == host and yesno("  Final confirmation: write plaintext secrets?"):
+            unredacted = True
         else:
-            lines.append(f"| **Last Scan** | {fmt_val(scan)} |")
-
-        topo = pool.get("topology", {})
-        for vdev_type in ("data", "cache", "log", "spare", "special", "dedup", "metadata"):
-            vdevs = topo.get(vdev_type, [])
-            if not vdevs:
-                continue
-            lines.append(f"\n**{vdev_type.upper()} vdevs:**\n")
-            for vdev in vdevs:
-                vname = vdev.get("name", vdev.get("type", "unknown"))
-                vstatus = vdev.get("status", "—")
-                lines.append(f"- **{vname}** — status: {vstatus}")
-                children = vdev.get("children", [])
-                for child in children:
-                    cname = child.get("device", child.get("name", "—"))
-                    cstatus = child.get("status", "—")
-                    cstats = child.get("stats", {})
-                    read_errs = cstats.get("read_errors", 0)
-                    write_errs = cstats.get("write_errors", 0)
-                    cksum_errs = cstats.get("checksum_errors", 0)
-                    lines.append(f"  - `{cname}` — {cstatus} "
-                                 f"(R:{read_errs} W:{write_errs} C:{cksum_errs} errors)")
-        lines.append("")
-    return "\n".join(lines) + "\n"
-
-
-def appendix_smart(session, base):
-    """Latest SMART results per disk."""
-    lines = ["## A2 — Disk SMART Health\n"]
-    disks, err = fetch(session, base, "/disk")
-    if err:
-        lines.append(f"*Skipped — {err}*\n")
-        return "\n".join(lines)
-    if not disks:
-        lines.append("*No disks found.*\n")
-        return "\n".join(lines)
-
-    lines.append("| Disk | Model | Serial | Size | Pool | Temp |")
-    lines.append("| :--- | :--- | :--- | :--- | :--- | :--- |")
-
-    for disk in disks:
-        name = disk.get("name", "—")
-        temp_val = disk.get("temperature")
-        temp = f"{temp_val}°C" if temp_val else "—"
-        lines.append(
-            f"| {name} "
-            f"| {pipe_escape(fmt_val(disk.get('model','—'), 30))} "
-            f"| {disk.get('serial','—')} "
-            f"| {fmt_bytes(disk.get('size', 0))} "
-            f"| {disk.get('pool','—') or '—'} "
-            f"| {temp} |"
-        )
-
-    smart_results, serr = fetch(session, base, "/smart/test/results")
-    if not serr and smart_results and isinstance(smart_results, list):
-        lines.append("\n### Recent SMART Test Results\n")
-        lines.append("| Disk | Test Type | Status | Remaining | Lifetime Hours | LBA of First Error |")
-        lines.append("| :--- | :--- | :--- | :--- | :--- | :--- |")
-        for result in smart_results:
-            if not isinstance(result, dict):
-                continue
-            disk_name = result.get("disk", "—")
-            tests = result.get("tests", [])
-            for test in (tests[:5] if tests else []):
-                if not isinstance(test, dict):
-                    continue
-                lines.append(
-                    f"| {disk_name} "
-                    f"| {fmt_val(test.get('type', test.get('description', '—')), 15)} "
-                    f"| {fmt_val(test.get('status', '—'), 25)} "
-                    f"| {fmt_val(test.get('remaining', '—'))} "
-                    f"| {fmt_val(test.get('lifetime', test.get('power_on_hours', '—')))} "
-                    f"| {fmt_val(test.get('lba_of_first_error', '—'))} |"
-                )
-    lines.append("")
-    return "\n".join(lines) + "\n"
-
-
-def appendix_encryption(session, base):
-    """Dataset encryption summary."""
-    lines = ["## A3 — Encryption Status\n"]
-    datasets, err = fetch(session, base, "/pool/dataset")
-    if err:
-        lines.append(f"*Skipped — {err}*\n")
-        return "\n".join(lines)
-
-    encrypted = [d for d in datasets
-                 if isinstance(d, dict) and fmt_val(d.get("encrypted")) == "Yes"]
-    if not encrypted:
-        lines.append("*No encrypted datasets found.*\n")
-        return "\n".join(lines)
-
-    lines.append("| Dataset | Algorithm | Key Format | Locked | Key Loaded |")
-    lines.append("| :--- | :--- | :--- | :--- | :--- |")
-    for ds in encrypted:
-        lines.append(
-            f"| {pipe_escape(fmt_val(ds.get('name','—')))} "
-            f"| {fmt_val(ds.get('encryption_algorithm','—'))} "
-            f"| {fmt_val(ds.get('key_format','—'))} "
-            f"| {fmt_val(ds.get('locked','—'))} "
-            f"| {fmt_val(ds.get('key_loaded','—'))} |"
-        )
-
-    pools, _ = fetch(session, base, "/pool")
-    if pools:
-        for pool in pools:
-            pool_name = pool.get("name")
-            if not pool_name:
-                continue
-            # encryption_summary is a job-based method: it takes the dataset id as a
-            # bare value and returns a job ID that must be polled for the result.
-            summary, serr = post(session, base,
-                                 "/pool/dataset/encryption_summary",
-                                 pool_name)
-            if not serr and isinstance(summary, int):
-                summary, serr = wait_job(session, base, summary, timeout=60)
-            if not serr and summary and isinstance(summary, list):
-                lines.append(f"\n**Encryption summary for pool `{pool_name}`:**\n")
-                lines.append("| Dataset | Key Format | Key Present | Locked |")
-                lines.append("| :--- | :--- | :--- | :--- |")
-                for entry in summary:
-                    if isinstance(entry, dict):
-                        lines.append(
-                            f"| {pipe_escape(fmt_val(entry.get('name','—')))} "
-                            f"| {fmt_val(entry.get('key_format','—'))} "
-                            f"| {fmt_val(entry.get('key_present_on_system','—'))} "
-                            f"| {fmt_val(entry.get('locked','—'))} |"
-                        )
-    lines.append("")
-    return "\n".join(lines) + "\n"
-
-
-def appendix_cloud_credentials(session, base):
-    """Cloud storage credentials inventory (redacted unless disabled)."""
-    lines = ["## A4 — Cloud Credentials Inventory\n"]
-    creds, err = fetch(session, base, "/cloudsync/credentials")
-    if err:
-        lines.append(f"*Skipped — {err}*\n")
-        return "\n".join(lines)
-    if not creds:
-        lines.append("*No cloud credentials configured.*\n")
-        return "\n".join(lines)
-
-    creds = redact(creds)
-    lines.append("| ID | Name | Provider |")
-    lines.append("| :--- | :--- | :--- |")
-    for cred in creds:
-        if not isinstance(cred, dict):
-            continue
-        lines.append(
-            f"| {cred.get('id','—')} "
-            f"| {pipe_escape(fmt_val(cred.get('name','—')))} "
-            f"| {pipe_escape(fmt_val(cred.get('provider','—')))} |"
-        )
-    lines.append("")
-    return "\n".join(lines) + "\n"
-
-
-def appendix_iscsi_topology(session, base):
-    """iSCSI relationship map: portals -> targets -> extents."""
-    lines = ["## A5 — iSCSI Topology Map\n"]
-
-    portals, _ = fetch(session, base, "/iscsi/portal")
-    targets, _ = fetch(session, base, "/iscsi/target")
-    extents, _ = fetch(session, base, "/iscsi/extent")
-    maps, _ = fetch(session, base, "/iscsi/targetextent")
-    initiators, _ = fetch(session, base, "/iscsi/initiator")
-
-    if not targets:
-        lines.append("*No iSCSI targets configured.*\n")
-        return "\n".join(lines)
-
-    portal_map = {}
-    if portals:
-        for p in portals:
-            listen = p.get("listen", [])
-            addrs = ", ".join(f"{l.get('ip','*')}:{l.get('port',3260)}" for l in listen) if listen else "—"
-            portal_map[p.get("id")] = addrs
-
-    extent_map = {}
-    if extents:
-        for e in extents:
-            extent_map[e.get("id")] = {
-                "name": e.get("name", "—"),
-                "type": e.get("type", "—"),
-                "path": e.get("path", e.get("disk", "—")),
-                "enabled": e.get("enabled", True),
-            }
-
-    target_extents = defaultdict(list)
-    if maps:
-        for m in maps:
-            eid = m.get("extent")
-            ext = extent_map.get(eid, {"name": f"extent-{eid}", "type": "—", "path": "—"})
-            target_extents[m.get("target")].append({"lun": m.get("lunid", "—"), **ext})
-
-    initiator_map = {}
-    if initiators:
-        for ini in initiators:
-            initiator_map[ini.get("id")] = {
-                "comment": ini.get("comment", "—"),
-                "initiators": ini.get("initiators", []),
-            }
-
-    for tgt in targets:
-        tid = tgt.get("id")
-        lines.append(f"### Target: {pipe_escape(tgt.get('name','—'))}\n")
-
-        tgt_groups = tgt.get("groups", [])
-        if tgt_groups:
-            lines.append("**Portal / Initiator Groups:**\n")
-            lines.append("| Portal | Listen Addresses | Initiator Group | Auth Method |")
-            lines.append("| :--- | :--- | :--- | :--- |")
-            for grp in tgt_groups:
-                portal_id = grp.get("portal")
-                init_id = grp.get("initiator")
-                auth = grp.get("authmethod", "—")
-                portal_addr = portal_map.get(portal_id, f"portal-{portal_id}")
-                init_info = initiator_map.get(init_id, {"comment": f"group-{init_id}"})
-                lines.append(
-                    f"| {portal_id} | {pipe_escape(portal_addr)} "
-                    f"| {pipe_escape(fmt_val(init_info.get('comment','—')))} "
-                    f"| {auth} |"
-                )
-            lines.append("")
-
-        texts = target_extents.get(tid, [])
-        if texts:
-            lines.append("**Mapped Extents:**\n")
-            lines.append("| LUN | Extent Name | Type | Path / Device | Enabled |")
-            lines.append("| :--- | :--- | :--- | :--- | :--- |")
-            for ext in texts:
-                lines.append(
-                    f"| {ext.get('lun','—')} "
-                    f"| {pipe_escape(ext.get('name','—'))} "
-                    f"| {ext.get('type','—')} "
-                    f"| {pipe_escape(fmt_val(ext.get('path','—'), 50))} "
-                    f"| {'Yes' if ext.get('enabled') else 'No'} |"
-                )
-            lines.append("")
-        else:
-            lines.append("*No extents mapped to this target.*\n")
-
-    return "\n".join(lines) + "\n"
-
-
-def appendix_update_status(session, base):
-    """Current update train and available updates."""
-    lines = ["## A6 — Update & Patch Status\n"]
-
-    trains, terr = fetch(session, base, "/update/get_trains")
-    if not terr and trains and isinstance(trains, dict):
-        trains = redact(trains)
-        current = trains.get("current", "—")
-        lines.append(f"**Current train:** `{current}`\n")
-        available = trains.get("trains", {})
-        if available:
-            lines.append("| Train | Description |")
-            lines.append("| :--- | :--- |")
-            for tname, tinfo in available.items():
-                desc = tinfo.get("description", "—") if isinstance(tinfo, dict) else "—"
-                marker = " **(active)**" if tname == current else ""
-                lines.append(f"| `{tname}`{marker} | {pipe_escape(fmt_val(desc, 80))} |")
-            lines.append("")
-
-    update, uerr = post(session, base, "/update/check_available")
-    if not uerr and update and isinstance(update, dict):
-        update = redact(update)
-        status = update.get("status", "—")
-        lines.append(f"**Update status:** {status}\n")
-        if status == "AVAILABLE":
-            changes = update.get("changes", [])
-            if changes:
-                lines.append("**Pending changes:**\n")
-                lines.append("| Operation | Old | New |")
-                lines.append("| :--- | :--- | :--- |")
-                for ch in changes[:30]:
-                    if isinstance(ch, dict):
-                        lines.append(
-                            f"| {ch.get('operation','—')} "
-                            f"| {pipe_escape(fmt_val(ch.get('old','—'), 40))} "
-                            f"| {pipe_escape(fmt_val(ch.get('new','—'), 40))} |"
-                        )
-                if len(changes) > 30:
-                    lines.append(f"\n*... and {len(changes)-30} more changes.*\n")
-                lines.append("")
-        else:
-            lines.append("*System is up to date.*\n")
-    elif uerr:
-        lines.append(f"*Update check skipped — {uerr}*\n")
-
-    return "\n".join(lines) + "\n"
-
-
-def appendix_app_detail(session, base):
-    """Detailed config for each app / chart release."""
-    lines = ["## A7 — Application Detail\n"]
-    apps, err = fetch(session, base, "/chart/release")
-    if err:
-        lines.append(f"*Skipped — {err}*\n")
-        return "\n".join(lines)
-    if not apps:
-        lines.append("*No apps installed.*\n")
-        return "\n".join(lines)
-
-    for app in apps:
-        if not isinstance(app, dict):
-            continue
-        app = redact(app)
-        name = app.get("name", "unknown")
-        lines.append(f"### {pipe_escape(name)}\n")
-        lines.append("| Property | Value |")
-        lines.append("| :--- | :--- |")
-
-        for k in ("status", "human_version", "update_available", "catalog",
-                   "catalog_train", "portal_urls", "used_ports"):
-            if k in app:
-                lines.append(f"| **{pretty_key(k)}** | {pipe_escape(fmt_val(app[k]))} |")
-
-        chart_config = app.get("config", {})
-        if isinstance(chart_config, dict):
-            image = chart_config.get("image", {})
-            if isinstance(image, dict):
-                repo = image.get("repository", "—")
-                tag = image.get("tag", "—")
-                lines.append(f"| **Image** | `{repo}:{tag}` |")
-
-            network = chart_config.get("network", chart_config.get("hostNetwork"))
-            if network is not None:
-                lines.append(f"| **Network** | {pipe_escape(fmt_val(network))} |")
-
-            env = chart_config.get("env", chart_config.get("extraEnvVars", {}))
-            if env:
-                env = redact(env) if isinstance(env, dict) else env
-                lines.append(f"| **Environment** | {pipe_escape(fmt_val(env))} |")
-
-        volumes = chart_config.get("ixVolumes", []) if isinstance(chart_config, dict) else []
-        if volumes:
-            vol_str = ", ".join(str(v.get("hostPath", v)) if isinstance(v, dict) else str(v)
-                                for v in volumes[:5])
-            lines.append(f"| **Host Volumes** | {pipe_escape(fmt_val(vol_str, 80))} |")
-
-        lines.append("")
-    return "\n".join(lines) + "\n"
-
-
-def appendix_audit(session, base):
-    """Recent audit log entries."""
-    lines = ["## A8 — Audit Log (Recent Activity)\n"]
-
-    audit, err = post(session, base, "/audit/query",
-                      {"query-filters": [], "query-options": {"limit": 50, "order_by": ["-message_timestamp"]}})
-    if err:
-        audit, err2 = fetch(session, base, "/audit/query")
-        if err2:
-            lines.append(f"*Audit log not available — {err}*\n")
-            return "\n".join(lines)
-
-    if not audit:
-        lines.append("*No audit entries returned.*\n")
-        return "\n".join(lines)
-
-    audit = redact(audit)
-
-    if isinstance(audit, list) and audit and isinstance(audit[0], dict):
-        lines.append("| Timestamp | Service | Event | Username | Address | Message |")
-        lines.append("| :--- | :--- | :--- | :--- | :--- | :--- |")
-        for entry in audit[:50]:
-            lines.append(
-                f"| {fmt_val(entry.get('message_timestamp','—'), 20)} "
-                f"| {fmt_val(entry.get('service','—'), 15)} "
-                f"| {fmt_val(entry.get('event','—'), 20)} "
-                f"| {fmt_val(entry.get('username','—'), 15)} "
-                f"| {fmt_val(entry.get('address','—'), 15)} "
-                f"| {pipe_escape(fmt_val(entry.get('event_data', entry.get('message','')), 50))} |"
-            )
-        lines.append("")
-    else:
-        lines.append(f"```\n{json.dumps(audit, indent=2)[:3000]}\n```\n")
-
-    return "\n".join(lines) + "\n"
-
-
-def appendix_dataset_quotas(session, base):
-    """Quota utilisation for datasets with quotas set."""
-    lines = ["## A9 — Dataset Quota Utilisation\n"]
-    datasets, err = fetch(session, base, "/pool/dataset")
-    if err:
-        lines.append(f"*Skipped — {err}*\n")
-        return "\n".join(lines)
-
-    rows = []
-    for ds in datasets:
-        if not isinstance(ds, dict):
-            continue
-        quota = fmt_val(ds.get("quota", "—"))
-        refquota = fmt_val(ds.get("refquota", "—"))
-        if quota in ("—", "0", "None", "0B", "0") and refquota in ("—", "0", "None", "0B", "0"):
-            continue
-        rows.append({
-            "name": fmt_val(ds.get("name", "—")),
-            "used": fmt_val(ds.get("used", "—")),
-            "available": fmt_val(ds.get("available", "—")),
-            "quota": quota,
-            "refquota": refquota,
-        })
-
-    if not rows:
-        lines.append("*No datasets with quotas configured.*\n")
-        return "\n".join(lines)
-
-    lines.append("| Dataset | Used | Available | Quota | Ref Quota |")
-    lines.append("| :--- | :--- | :--- | :--- | :--- |")
-    for r in rows:
-        lines.append(
-            f"| {pipe_escape(r['name'])} "
-            f"| {r['used']} "
-            f"| {r['available']} "
-            f"| {r['quota']} "
-            f"| {r['refquota']} |"
-        )
-    lines.append("")
-    return "\n".join(lines) + "\n"
-
-
-def appendix_system_dataset(session, base):
-    """System dataset and syslog configuration."""
-    lines = ["## A10 — System Dataset & Syslog\n"]
-
-    sysds, err = fetch(session, base, "/systemdataset")
-    if not err and sysds:
-        lines.append("### System Dataset\n")
-        lines.append(format_kv(sysds))
-
-    syslog, err2 = fetch(session, base, "/system/advanced")
-    if not err2 and isinstance(syslog, dict):
-        lines.append("### Syslog Configuration\n")
-        syslog_keys = {
-            "syslogserver", "sysloglevel", "syslog_transport", "syslog_tls_certificate",
-            "consolemsg", "serialconsole", "serialport", "serialspeed",
-            "motd", "fqdn_syslog", "sed_user", "kernel_extra_options",
-        }
-        filtered = {k: v for k, v in syslog.items() if k in syslog_keys}
-        if filtered:
-            lines.append(format_kv(redact(filtered)))
-        else:
-            lines.append("*No syslog-specific settings found in advanced config.*\n")
-
-    return "\n".join(lines) + "\n"
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  CONFIG BACKUP DOWNLOAD
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def looks_like_tar(b):
-    """POSIX tar files carry the 'ustar' magic at byte offset 257."""
-    return isinstance(b, (bytes, bytearray)) and len(b) > 512 and b[257:262] == b"ustar"
-
-
-def download_config(session, base):
-    """
-    Download the config DB backup, handling both API generations:
-      - Modern SCALE: core.download returns [job_id, url]; fetch the URL
-      - Legacy:       POST /config/save streams the tar directly
-    Raises on failure; validates the result is actually a tar.
-    """
-    root = base.rstrip("/") + "/"
-
-    # ── Modern flow: core.download ────────────────────────────────────────────
-    try:
-        r = session.post(urljoin(root, "api/v2.0/core/download"),
-                         json=["config.save", [{"secretseed": True}], "config.tar"],
-                         timeout=60)
-        if r.ok:
-            resp = r.json()
-            if isinstance(resp, list) and len(resp) == 2:
-                _job_id, dl_path = resp
-                r2 = session.get(urljoin(root, str(dl_path).lstrip("/")), timeout=120)
-                r2.raise_for_status()
-                if looks_like_tar(r2.content):
-                    return r2.content
-    except Exception:
-        pass  # fall through to legacy
-
-    # ── Legacy flow: direct /config/save ──────────────────────────────────────
-    r = session.post(urljoin(root, "api/v2.0/config/save"),
-                     json={"secretseed": True}, timeout=120)
-    r.raise_for_status()
-    if looks_like_tar(r.content):
-        return r.content
-
-    raise RuntimeError(
-        f"API returned {len(r.content)} bytes that are not a tar archive "
-        f"(starts with {r.content[:24]!r}). This TrueNAS version may require "
-        f"a different download flow — save the config manually from the UI."
-    )
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-#  MAIN
-# ═══════════════════════════════════════════════════════════════════════════════
+            print("  Not confirmed — continuing in REDACTED mode.")
+
+    # 3. sections
+    keys = [k for k, _, _ in SECTIONS]
+    print("\nSections (all included by default):")
+    for i, (k, t, _) in enumerate(SECTIONS, 1):
+        print(f"  {i}. {t}")
+    a = ask("Numbers to EXCLUDE, comma-separated (Enter for none)", "")
+    excl = {keys[int(x) - 1] for x in re.split(r"[,\s]+", a) if x.isdigit() and 0 < int(x) <= len(keys)}
+    sections = [k for k in keys if k not in excl]
+
+    # 4. detail
+    full = ask("\nDetail: 1. summary tables  2. full (every setting of every object)", "2", ["1", "2"]) == "2"
+    appendix = yesno("Append every other non-empty config table?", full)
+    builtin = yesno("Include built-in system users and groups?", False)
+
+    # 5. format
+    f = ask("\nFormat: 1. Markdown  2. HTML (printable)  3. both", "3", ["1", "2", "3"])
+    formats = {"1": ["md"], "2": ["html"], "3": ["md", "html"]}[f]
+
+    # 6. output + encryption
+    outdir = os.path.expanduser(ask("Output folder", args.out or os.getcwd()))
+    rec, sym = None, False
+    if shutil.which("gpg"):
+        print("\nEncrypt the output with GPG? (plaintext never touches disk)\n"
+              "  1. No\n  2. To a public key (recipient)\n  3. Symmetric passphrase")
+        g = ask("Choose", "2" if unredacted else "1", ["1", "2", "3"])
+        if g == "2":
+            while True:
+                rec = ask("  Recipient (email or key ID; blank to cancel)").strip()
+                if not rec:
+                    sys.exit("No recipient given — nothing was written.")
+                if gpg_key_usable(rec):
+                    break
+                print(f"  No usable encryption key for {rec!r} in your keyring. "
+                      "Check: gpg --list-keys")
+        elif g == "3":
+            sym = True
+    elif unredacted:
+        print("\n  ! gpg not found — unredacted output will be written as plaintext (0600).")
+
+    ctx = Ctx(cfg, unredacted, full, builtin)
+    doc = build_doc(ctx, sections, appendix)
+    files = emit(ctx, doc, formats, outdir, rec, sym)
+    report(ctx, files)
+
+
+def report(ctx, files):
+    s = ctx.stats
+    print("\nDone.")
+    for p in files:
+        print(f"  {p}  ({os.path.getsize(p):,} bytes, mode 0600)")
+    print(f"  Secret fields: {s['secrets']}   Encrypted fields decrypted: {s['decrypted']}")
+    if s["undecryptable"]:
+        print(f"  ! {s['undecryptable']} encrypted field(s) could not be read: "
+              + ctx._why_unreadable())
+    if ctx.unredacted and not any(p.endswith(".gpg") for p in files):
+        print("  ⚠ Plaintext secrets on disk. Move to offline storage; note that deleting "
+              "files on ZFS/SSD does not securely erase them (snapshots, TRIM).")
+
+
+# ---------------------------------------------------------------------------
 
 def main():
-    prompt_config()
-    Path(OUTPUT_DIR).mkdir(parents=True, exist_ok=True)
+    ap = argparse.ArgumentParser(description="Build DR documentation from a TrueNAS config export (offline).")
+    ap.add_argument("-c", "--config", help="config export (.tar with secret seed, or .db)")
+    ap.add_argument("--seed", help="separate pwenc_secret file (if exported apart from the .db)")
+    ap.add_argument("--batch", action="store_true", help="no prompts; use flags/defaults")
+    ap.add_argument("--unredacted", action="store_true", help="plaintext secrets (needs --confirm-host)")
+    ap.add_argument("--confirm-host", help="hostname, required with --unredacted in batch mode")
+    ap.add_argument("--summary", action="store_true", help="summary tables only (default: full)")
+    ap.add_argument("--no-appendix", action="store_true", help="omit generic dump of other tables")
+    ap.add_argument("--builtin", action="store_true", help="include built-in users/groups")
+    ap.add_argument("--sections", help="comma list: " + ",".join(k for k, _, _ in SECTIONS))
+    ap.add_argument("--format", default="md,html", help="md, html or md,html")
+    ap.add_argument("-o", "--out", help="output folder (default: current)")
+    ap.add_argument("--gpg-recipient", help="encrypt output to this GPG key")
+    ap.add_argument("--gpg-symmetric", action="store_true", help="encrypt output with a passphrase")
+    ap.add_argument("--version", action="version", version=VERSION)
+    args = ap.parse_args()
 
-    ts       = datetime.datetime.now().strftime("%Y-%m-%d_%H%M")
-    label    = "UNREDACTED" if not REDACT_ENABLED else "redacted"
-    md_path  = Path(OUTPUT_DIR) / f"truenas_runbook_{ts}_{label}.md"
-    tar_path = Path(OUTPUT_DIR) / f"truenas_backup_{ts}.tar"
-
-    session = requests.Session()
-    session.headers.update({"Authorization": f"Bearer {TRUENAS_APIKEY}"})
-    session.verify = VERIFY_SSL
-
-    # Connectivity check
-    print(f"Connecting to {TRUENAS_HOST} ...")
-    sys_info, err = fetch(session, TRUENAS_HOST, "/system/info")
-    if err:
-        print(f"  ✗ Connection failed: {err}")
-        sys.exit(1)
-    hostname = sys_info.get("hostname", "unknown") if isinstance(sys_info, dict) else "unknown"
-    version  = sys_info.get("version", "unknown") if isinstance(sys_info, dict) else "unknown"
-    print(f"  ✓ Connected — {hostname} running {version}\n")
-
-    # ══════════════════════════════════════════════════════════════════════════
-    #  Build document
-    # ══════════════════════════════════════════════════════════════════════════
-    doc = []
-    doc.append("# TrueNAS Infrastructure Runbook\n")
-    doc.append(f"> **Host:** {hostname}  ")
-    doc.append(f"> **Version:** {version}  ")
-    doc.append(f"> **Generated:** {ts}  ")
-    doc.append(f"> **Redaction:** {'Enabled — secrets masked' if REDACT_ENABLED else 'DISABLED — plain text secrets included'}  ")
-
-    if not REDACT_ENABLED:
-        doc.append("")
-        doc.append("---")
-        doc.append("")
-        doc.append("> **⚠️  WARNING: THIS DOCUMENT CONTAINS UNREDACTED CREDENTIALS**  ")
-        doc.append("> ")
-        doc.append("> This file includes passwords, API keys, encryption secrets, and  ")
-        doc.append("> private keys in **plain text**. It is intended for secure offline  ")
-        doc.append("> storage only (encrypted drive, fire safe, safety deposit box).  ")
-        doc.append("> ")
-        doc.append("> **Do not share electronically. Do not store in cloud services.  ")
-        doc.append("> Do not commit to version control.**  ")
-
-    doc.append("")
-    doc.append("---\n")
-
-    # ── Master table of contents ──────────────────────────────────────────────
-    doc.append("## Table of Contents\n")
-    doc.append("### Part 1 — Configuration Archive\n")
-    for i, (lbl, _, _, _) in enumerate(SECTIONS, 1):
-        anchor = lbl.lower().replace(" ", "-").replace("/","").replace("(","").replace(")","")
-        doc.append(f"{i}. [{lbl}](#{anchor})")
-
-    if DEEP_DIVE:
-        doc.append("\n### Part 2 — Deep Dive Appendix\n")
-        appendix_titles = [
-            "A1 — Pool Health & Capacity",
-            "A2 — Disk SMART Health",
-            "A3 — Encryption Status",
-            "A4 — Cloud Credentials Inventory",
-            "A5 — iSCSI Topology Map",
-            "A6 — Update & Patch Status",
-            "A7 — Application Detail",
-            "A8 — Audit Log (Recent Activity)",
-            "A9 — Dataset Quota Utilisation",
-            "A10 — System Dataset & Syslog",
-        ]
-        for title in appendix_titles:
-            anchor = title.lower().replace(" ", "-").replace("—","").replace("&","").replace("/","")
-            anchor = anchor.replace("(","").replace(")","").replace("  ", "-")
-            doc.append(f"- [{title}](#{anchor})")
-
-    doc.append("\n---\n")
-
-    # ══════════════════════════════════════════════════════════════════════════
-    #  Part 1 — Configuration Archive
-    # ══════════════════════════════════════════════════════════════════════════
-    doc.append("# Part 1 — Configuration Archive\n")
-
-    success = 0
-    skipped = 0
-
-    for lbl, endpoint, key_filter, mode in SECTIONS:
-        print(f"  [{success+skipped+1:2d}/{len(SECTIONS)}] {lbl:<30s} {endpoint}")
-        data, err = fetch(session, TRUENAS_HOST, endpoint)
-
-        doc.append(f"## {lbl}\n")
-
-        if err:
-            doc.append(f"*Skipped — {err}*\n")
-            skipped += 1
-            continue
-
-        data = redact(data)
-        data = filter_keys(data, key_filter)
-        doc.append(format_section(data, mode))
-        success += 1
-
-    print(f"\n  Part 1 complete: {success} sections, {skipped} skipped\n")
-
-    # ══════════════════════════════════════════════════════════════════════════
-    #  Part 2 — Deep Dive Appendix
-    # ══════════════════════════════════════════════════════════════════════════
-    if DEEP_DIVE:
-        doc.append("---\n")
-        doc.append("# Part 2 — Deep Dive Appendix\n")
-        doc.append("> These sections reflect the **live state** of the system at generation time.")
-        doc.append("> They complement the configuration archive with health, status, and diagnostic data.\n")
-
-        appendix_funcs = [
-            ("Pool Health & Capacity",        appendix_pool_health),
-            ("Disk SMART Health",             appendix_smart),
-            ("Encryption Status",             appendix_encryption),
-            ("Cloud Credentials Inventory",   appendix_cloud_credentials),
-            ("iSCSI Topology Map",            appendix_iscsi_topology),
-            ("Update & Patch Status",         appendix_update_status),
-            ("Application Detail",            appendix_app_detail),
-            ("Audit Log",                     appendix_audit),
-            ("Dataset Quota Utilisation",     appendix_dataset_quotas),
-            ("System Dataset & Syslog",       appendix_system_dataset),
-        ]
-
-        for title, func in appendix_funcs:
-            print(f"  [appendix] {title}")
-            try:
-                doc.append(func(session, TRUENAS_HOST))
-            except Exception as e:
-                doc.append(f"## {title}\n\n*Error generating section: {e}*\n")
-
-        print(f"\n  Part 2 complete: {len(appendix_funcs)} appendix sections\n")
-
-    # ══════════════════════════════════════════════════════════════════════════
-    #  Write output
-    # ══════════════════════════════════════════════════════════════════════════
-    md_path.write_text("\n".join(doc), encoding="utf-8")
-    print(f"  ✓ Runbook saved → {md_path}")
-
-    if not REDACT_ENABLED:
-        print("  ⚠  OUTPUT CONTAINS PLAIN TEXT SECRETS — store securely")
-
-    # Download config backup
-    if DOWNLOAD_BACKUP:
-        print("  Downloading config backup (with secret seed) ...")
-        try:
-            content = download_config(session, TRUENAS_HOST)
-            tar_path.write_bytes(content)
-            print(f"  ✓ Backup saved  → {tar_path}  ({len(content)//1024} KB)")
-        except Exception as e:
-            print(f"  ✗ Backup failed: {e}")
-
-    print("\nDone.\n")
+    try:
+        if not args.batch:
+            return wizard(args)
+        if not args.config:
+            ap.error("--batch needs --config")
+        cfg = load_config(os.path.expanduser(args.config), args.seed)
+        probe = Ctx(cfg, False, False, False)
+        host, _ = hostname(probe)
+        if args.unredacted and args.confirm_host != host:
+            sys.exit(f"--unredacted requires --confirm-host {host!r}. Refusing.")
+        if args.gpg_recipient is not None and args.gpg_symmetric:
+            ap.error("use either --gpg-recipient or --gpg-symmetric, not both")
+        if args.gpg_recipient is not None and not gpg_key_usable(args.gpg_recipient.strip() or "-"):
+            sys.exit(f"No usable GPG encryption key for {args.gpg_recipient!r}. Nothing was written.")
+        secs = [s.strip() for s in args.sections.split(",")] if args.sections else [k for k, _, _ in SECTIONS]
+        bad = set(secs) - {k for k, _, _ in SECTIONS}
+        if bad:
+            ap.error(f"unknown section(s): {', '.join(sorted(bad))}")
+        formats = list(dict.fromkeys(f.strip().lower() for f in args.format.split(",") if f.strip()))
+        if not formats or set(formats) - {"md", "html"}:
+            ap.error("--format must be md, html or md,html")
+        ctx = Ctx(cfg, args.unredacted, not args.summary, args.builtin)
+        doc = build_doc(ctx, secs, not args.no_appendix)
+        files = emit(ctx, doc, formats, os.path.expanduser(args.out or os.getcwd()),
+                     args.gpg_recipient, args.gpg_symmetric)
+        report(ctx, files)
+    except (ConfigError, OSError, RuntimeError, sqlite3.Error) as e:
+        sys.exit(f"Error: {e}")
+    except KeyboardInterrupt:
+        sys.exit("\nAborted.")
 
 
 if __name__ == "__main__":
